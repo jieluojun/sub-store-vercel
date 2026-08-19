@@ -5,7 +5,7 @@
       "src": "server.js",
       "use": "@vercel/node",
       "config": {
-        "includeFiles": "{dist.zip,version.json}",
+        "includeFiles": "{dist.zip,version.json,sub-store.min.js}",
         "maxDuration": 60,
         "memory": 1024
       }

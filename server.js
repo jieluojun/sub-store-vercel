@@ -22,7 +22,7 @@ const path = require('path');
 const fs = require('fs');
 const zlib = require('zlib');
 
-const ENTRY_VERSION = 'v6-gist-sync-per-request-2026-08-19';
+const ENTRY_VERSION = 'v7-fix-boot-blob-2026-08-19';
 
 /* ================= 默认配置 (可在 Vercel 环境变量中覆盖) ================= */
 
@@ -803,6 +803,12 @@ module.exports = async function handler(req, res) {
   } catch (e) {}
 
   const reqPath = (req.url || '').split('?')[0].replace(/\/+$/, '') || '/';
+
+  try {
+    await ensureBackend();
+  } catch (e) {
+    pushError('ensureBackend', e);
+  }
 
   // 公开自检 (只读, 无敏感信息)
   if (reqPath === '/__substore_selftest') {
