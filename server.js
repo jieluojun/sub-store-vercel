@@ -22,7 +22,7 @@ const path = require('path');
 const fs = require('fs');
 const zlib = require('zlib');
 
-const ENTRY_VERSION = 'v7-fix-boot-blob-2026-08-19';
+const ENTRY_VERSION = 'v8-blob-not-gist-boot-2026-08-19';
 
 /* ================= 默认配置 (可在 Vercel 环境变量中覆盖) ================= */
 
