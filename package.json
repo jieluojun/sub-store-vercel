@@ -1,0 +1,31 @@
+{
+  "name": "sub-store-vercel-flat",
+  "version": "2.36.38",
+  "private": true,
+  "description": "Sub-Store 一键部署到 Vercel (前后端同域名合并部署) | 后端 2.36.38 + 前端 2.29.10",
+  "license": "GPL-3.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "node dev.js",
+    "start": "node dev.js"
+  },
+  "dependencies": {
+    "@vercel/blob": "^2.0.0",
+    "@maxmind/geoip2-node": "^5.0.0",
+    "body-parser": "^1.19.0",
+    "connect-history-api-fallback": "^2.0.0",
+    "core-js": "^3.49.0",
+    "cron": "^3.1.6",
+    "dns-packet": "^5.6.1",
+    "dotenv": "^16.4.7",
+    "express": "^4.17.1",
+    "fetch-socks": "^1.3.3",
+    "http-proxy-middleware": "^3.0.3",
+    "mime-types": "^2.1.35",
+    "ms": "^2.1.3",
+    "nanoid": "^3.3.3",
+    "undici": "^8.8.0"
+  }
+}
