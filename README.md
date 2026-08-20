@@ -41,9 +41,7 @@
 
 5. **推荐：用 Vercel Blob 当共享盘（解决刷新「上次上传」乱跳）**  
    `/tmp` 每个 Lambda 一份，Blob 是全项目共用。  
-   1. Vercel 项目 → **Storage → Create Database → Blob** → 接到本项目（会自动注入 `BLOB_READ_WRITE_TOKEN`）；  
-   2. 把本仓库更新后的 `server.js` / `package.json` 推上去并 Redeploy；  
-   3. 打开 `https://域名/__substore_selftest`，应看到 `blobConfigured: true`，`blobStatus.hydrated` 或 `lastPut` 有值。  
+   Vercel 项目 → **Storage → Create Database → Blob** → 接到本项目（会自动注入 `BLOB_READ_WRITE_TOKEN`）；  
    之后改配置会自动写入 Blob，其它实例打开面板会拉同一份，不必再靠 Gist 当主库。Gist 仍可作额外备份。
 3. **国内访问** `*.vercel.app` 空白：挂代理，或在 Settings → Domains 绑自有域名（Cloudflare 托管 DNS 可直连）。
 4. 排查：发我 `__substore_selftest` 的 JSON 即可定位（`dataRestoreConfigured: true` 表示自动还原已配置）。
