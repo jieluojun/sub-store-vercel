@@ -1,0 +1,94 @@
+# ============================================================================
+# Sub-Store 前端/后端自动升级 (GitHub Actions)
+#
+# · 定时: UTC 每天 01:00 (北京时间 09:00) 自动检查
+# · 手动: GitHub 仓库 -> Actions -> "更新 Sub-Store" -> Run workflow (手机也行)
+#
+# 逻辑: 对比 version.json 中记录的当前版本与官方最新 Release,
+#       已是最新则直接跳过; 有新版本才下载并提交回仓库,
+#       提交后 Vercel 自动重新部署, 域名不变.
+#
+# ⚠️ 本文件必须放在仓库的 .github/workflows/ 目录下才会生效!
+#    上传后在 GitHub 文件页面点编辑, 把文件名改为:
+#    .github/workflows/update.yml   (输入 / 会自动创建目录)
+# ============================================================================
+
+name: 更新 Sub-Store
+
+on:
+  schedule:
+    - cron: '0 1 * * *'   # 每天 UTC 01:00 = 北京时间 09:00
+  workflow_dispatch:      # 允许手动触发
+
+permissions:
+  contents: write         # 允许提交回仓库 (使用 Actions 自带 TOKEN, 无需配置)
+
+jobs:
+  check-and-update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 对比版本并按需拉取
+        id: check
+        run: |
+          set -euo pipefail
+
+          # ---- 当前版本 ----
+          FE_CUR=$(jq -r '.frontend // ""' version.json 2>/dev/null || echo "")
+          BE_CUR=$(jq -r '.backend  // ""' version.json 2>/dev/null || echo "")
+          echo "当前版本: 前端=$FE_CUR 后端=$BE_CUR"
+
+          # ---- 官方最新版本 ----
+          FE_LATEST=$(curl -fsSL -H "User-Agent: sub-store-updater" \
+            "https://api.github.com/repos/sub-store-org/Sub-Store-Front-End/releases/latest" \
+            | jq -r '.tag_name // empty' | sed 's/^[vV]//')
+          BE_LATEST=$(curl -fsSL -H "User-Agent: sub-store-updater" \
+            "https://api.github.com/repos/sub-store-org/Sub-Store/releases/latest" \
+            | jq -r '.tag_name // empty' | sed 's/^[vV]//')
+
+          # 官方查询失败则中止, 不做任何修改 (防御)
+          if [ -z "$FE_LATEST" ] || [ -z "$BE_LATEST" ]; then
+            echo "::error::查询官方最新版本失败 (可能是 GitHub API 限流), 已中止, 未做任何更改"
+            exit 1
+          fi
+          echo "最新版本: 前端=$FE_LATEST 后端=$BE_LATEST"
+
+          # ---- 已是最新则不拉取 ----
+          FE_SAME=0; BE_SAME=0
+          [ "$FE_CUR" = "$FE_LATEST" ] && FE_SAME=1
+          [ "$BE_CUR" = "$BE_LATEST" ] && BE_SAME=1
+          if [ "$FE_SAME" = "1" ] && [ "$BE_SAME" = "1" ]; then
+            echo "✅ 前端与后端均已是最新版本, 无需拉取"
+            exit 0
+          fi
+
+          # ---- 拉取有新版本的部分 ----
+          if [ "$FE_SAME" = "0" ]; then
+            echo "⬇️  拉取前端 $FE_CUR -> $FE_LATEST"
+            curl -fsSL -o dist.zip \
+              "https://github.com/sub-store-org/Sub-Store-Front-End/releases/download/$FE_LATEST/dist.zip"
+            unzip -tq dist.zip > /dev/null   # 完整性校验
+            jq --arg v "$FE_LATEST" '.frontend = $v' version.json > version.json.tmp && mv version.json.tmp version.json
+          fi
+          if [ "$BE_SAME" = "0" ]; then
+            echo "⬇️  拉取后端 $BE_CUR -> $BE_LATEST"
+            curl -fsSL -o sub-store.min.js \
+              "https://github.com/sub-store-org/Sub-Store/releases/download/$BE_LATEST/sub-store.min.js"
+            [ "$(stat -c%s sub-store.min.js)" -gt 500000 ]   # 体积校验 (>500KB)
+            jq --arg v "$BE_LATEST" '.backend = $v' version.json > version.json.tmp && mv version.json.tmp version.json
+          fi
+
+      - name: 提交更新 (有变更才提交)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add dist.zip sub-store.min.js version.json
+          if git diff --staged --quiet; then
+            echo "无变更, 不提交"
+            exit 0
+          fi
+          git commit -m "chore: 自动升级 Sub-Store 前端/后端 [skip ci]"
+          git push
+          echo "🚀 已提交, Vercel 将自动重新部署 (约 1-2 分钟生效)"
