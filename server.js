@@ -21,9 +21,8 @@
 const path = require('path');
 const fs = require('fs');
 const zlib = require('zlib');
-const crypto = require('crypto');
 
-const ENTRY_VERSION = 'v11-global-config-api-scope-fix-2026-08-26';
+const ENTRY_VERSION = 'v9-r2-object-storage-2026-08-26';
 
 /* ================= 默认配置 (可在 Vercel 环境变量中覆盖) ================= */
 
@@ -261,7 +260,6 @@ try { require('@maxmind/geoip2-node'); } catch (e) { warnLoad('@maxmind/geoip2-n
 try { require('core-js/actual/promise/with-resolvers'); } catch (e) { warnLoad('core-js', e); }
 try { require('@vercel/blob'); } catch (e) { warnLoad('@vercel/blob', e); }
 try { require('@aws-sdk/client-s3'); } catch (e) { warnLoad('@aws-sdk/client-s3', e); }
-try { require('@vercel/global-config'); } catch (e) { warnLoad('@vercel/global-config', e); }
 
 /* ------------------------ 启动 Sub-Store 后端 (延后到共享存储灌盘之后) ------------------------ */
 
@@ -315,29 +313,13 @@ function selfTest(res) {
     autoUpdateVia: 'GitHub Actions (定时每天 + 手动 Run workflow)',
     dataRestoreConfigured: !!process.env.SUB_STORE_DATA_URL,
     objectStorageConfigured: storageConfigured(),
-    objectStorageRequestedProvider: requestedStorageProvider(),
     objectStorageProvider: storageProvider(),
     objectStorageStatus: lastStorageStatus,
     r2Configured: r2Configured(),
     r2MissingEnv: r2HasAnyConfig() ? r2MissingEnv() : [],
-    globalConfigConfigured: globalConfigConfigured(),
-    globalConfigMissingEnv:
-      globalConfigHasAnyConfig() || requestedStorageProvider() === 'vercel-global-config'
-        ? globalConfigMissingEnv()
-        : [],
-    globalConfigTeamScopeConfigured: !!(
-      process.env.GLOBAL_CONFIG_TEAM_ID ||
-      process.env.VERCEL_TEAM_ID ||
-      process.env.GLOBAL_CONFIG_TEAM_SLUG
-    ),
-    globalConfigOidcScopeAvailable: !!globalConfigOidcOwnerId(),
-    globalConfigWriteDiagnostic: lastGlobalConfigWriteDiagnostic,
     // 保留旧字段，方便已有排查脚本；这里仅表示 Vercel Blob 本身。
     blobConfigured: vercelBlobConfigured(),
-    blobStatus:
-      storageProvider() === 'vercel-blob'
-        ? lastStorageStatus
-        : { configured: vercelBlobConfigured() },
+    blobStatus: storageProvider() === 'vercel-blob' ? lastStorageStatus : { configured: vercelBlobConfigured() },
     gistSyncHookReady: typeof globalThis.__ssRestore === 'function',
     gistTokenConfigured: !!(
       process.env.SUB_STORE_GIST_TOKEN || process.env.GITHUB_TOKEN
@@ -581,7 +563,7 @@ function installGistSync(app) {
     if (!shouldPullGist(reqPath)) return next();
     const method = (req.method || 'GET').toUpperCase();
     if (method !== 'GET' && method !== 'HEAD') return next();
-    // 有 R2 / Global Config / Blob 时以共享存储为准，不再每次请求 Gist。
+    // 有 R2 / Vercel Blob 时以共享存储为准，不再每次请求 Gist。
     const pull = storageConfigured() ? pullStorageIntoMemory() : pullGistIntoMemory();
     Promise.resolve(pull)
       .then(() => next())
@@ -589,11 +571,10 @@ function installGistSync(app) {
   });
 }
 
-/* ---------- 共享存储：Cloudflare R2 / Vercel Global Config / Blob ---------- */
+/* ---------- 共享对象存储：Cloudflare R2 优先，兼容 Vercel Blob ---------- */
 
 const STORAGE_FILES = ['sub-store.json', 'root.json'];
 let storageLastEtag = '';
-let storageLastPutAt = 0;
 let storagePullInflight = null;
 let storagePullAt = 0;
 let storagePutTimer = null;
@@ -604,29 +585,6 @@ let storageHydrating = false;
 let storageMigratedFrom = null;
 let lastStorageStatus = { configured: false, provider: null };
 let cachedR2Client = null;
-let cachedGlobalConfigClient = null;
-let globalConfigReadCache = null;
-let globalConfigReadCacheAt = 0;
-let globalConfigReadInflight = null;
-let cachedGlobalConfigWriteTarget = null;
-let lastGlobalConfigWriteDiagnostic = null;
-
-function requestedStorageProvider() {
-  const value = String(process.env.SUB_STORE_STORAGE_PROVIDER || 'auto')
-    .trim()
-    .toLowerCase();
-  if (!value || value === 'auto') return 'auto';
-  if (value === 'r2' || value === 'cloudflare-r2') return 'cloudflare-r2';
-  if (
-    value === 'global-config' ||
-    value === 'vercel-global-config' ||
-    value === 'edge-config'
-  ) {
-    return 'vercel-global-config';
-  }
-  if (value === 'blob' || value === 'vercel-blob') return 'vercel-blob';
-  return value;
-}
 
 function storagePrefix() {
   const raw = String(
@@ -680,112 +638,16 @@ function r2Configured() {
   return r2MissingEnv().length === 0;
 }
 
-function globalConfigConnectionString() {
-  return String(
-    process.env.SUB_STORE_GLOBAL_CONFIG ||
-      process.env.GLOBAL_CONFIG ||
-      process.env.EDGE_CONFIG ||
-      '',
-  ).trim();
-}
-
-function globalConfigWriteToken() {
-  return String(
-    process.env.GLOBAL_CONFIG_WRITE_TOKEN ||
-      process.env.VERCEL_API_TOKEN ||
-      process.env.VERCEL_TOKEN ||
-      '',
-  ).trim();
-}
-
-function globalConfigId() {
-  const explicit = String(
-    process.env.GLOBAL_CONFIG_ID || process.env.EDGE_CONFIG_ID || '',
-  ).trim();
-  if (explicit) return explicit;
-  const connection = globalConfigConnectionString();
-  if (!connection) return '';
-  try {
-    const parsed = require('@vercel/global-config').parseConnectionString(
-      connection,
-    );
-    return parsed && parsed.id ? String(parsed.id) : '';
-  } catch (e) {
-    return '';
-  }
-}
-
-function globalConfigItemPrefix() {
-  return String(process.env.GLOBAL_CONFIG_ITEM_PREFIX || 'sub_store').trim();
-}
-
-function globalConfigItemKey(name) {
-  const suffix = name === 'root.json' ? 'root' : 'data';
-  return `${globalConfigItemPrefix()}_${suffix}`;
-}
-
-function globalConfigHasAnyConfig() {
-  return !!(
-    process.env.SUB_STORE_GLOBAL_CONFIG ||
-    process.env.GLOBAL_CONFIG ||
-    process.env.EDGE_CONFIG ||
-    process.env.GLOBAL_CONFIG_ID ||
-    process.env.EDGE_CONFIG_ID ||
-    process.env.GLOBAL_CONFIG_WRITE_TOKEN ||
-    process.env.VERCEL_API_TOKEN ||
-    process.env.VERCEL_TOKEN ||
-    process.env.GLOBAL_CONFIG_TEAM_ID ||
-    process.env.GLOBAL_CONFIG_TEAM_SLUG ||
-    process.env.GLOBAL_CONFIG_ITEM_PREFIX
-  );
-}
-
-function globalConfigMissingEnv() {
-  const missing = [];
-  if (!globalConfigConnectionString()) {
-    missing.push('GLOBAL_CONFIG (connect the store to this project)');
-  }
-  if (!globalConfigId()) missing.push('GLOBAL_CONFIG_ID (normally auto-detected)');
-  if (!globalConfigWriteToken()) {
-    missing.push('GLOBAL_CONFIG_WRITE_TOKEN (or VERCEL_API_TOKEN)');
-  }
-  const prefix = globalConfigItemPrefix();
-  if (!/^[A-Za-z0-9_-]+$/.test(prefix) || prefix.length > 240) {
-    missing.push('GLOBAL_CONFIG_ITEM_PREFIX (letters/numbers/_/-, max 240)');
-  }
-  return missing;
-}
-
-function globalConfigConfigured() {
-  return globalConfigMissingEnv().length === 0;
-}
-
 function vercelBlobConfigured() {
   return !!(
     process.env.BLOB_READ_WRITE_TOKEN ||
-    (process.env.VERCEL_OIDC_TOKEN && process.env.BLOB_STORE_ID)
+    process.env.VERCEL_OIDC_TOKEN
   );
 }
 
 function storageProvider() {
-  const requested = requestedStorageProvider();
-  if (requested === 'cloudflare-r2') {
-    return r2Configured() ? 'cloudflare-r2' : null;
-  }
-  if (requested === 'vercel-global-config') {
-    return globalConfigConfigured() ? 'vercel-global-config' : null;
-  }
-  if (requested === 'vercel-blob') {
-    return vercelBlobConfigured() ? 'vercel-blob' : null;
-  }
-  if (requested !== 'auto') return null;
-
-  // 自动模式：R2 优先；配置了 Global Config 写 Token 时再选它；最后兼容 Blob。
-  // 手动填写了部分 R2 变量时不静默回退，缺项会在自检中显示。
+  // 只要填写过任意 R2 变量，就不静默回退到 Blob；缺项会在自检中明确显示。
   if (r2HasAnyConfig()) return r2Configured() ? 'cloudflare-r2' : null;
-  if (globalConfigWriteToken()) {
-    return globalConfigConfigured() ? 'vercel-global-config' : null;
-  }
   if (vercelBlobConfigured()) return 'vercel-blob';
   return null;
 }
@@ -890,297 +752,6 @@ async function r2ReadFile(name) {
   }
 }
 
-function contentEtag(text) {
-  return crypto.createHash('sha256').update(String(text)).digest('hex');
-}
-
-function getGlobalConfigClient() {
-  if (cachedGlobalConfigClient) return cachedGlobalConfigClient;
-  if (!globalConfigConnectionString()) {
-    throw new Error('Global Config 缺少连接字符串 GLOBAL_CONFIG');
-  }
-  const { createClient } = require('@vercel/global-config');
-  cachedGlobalConfigClient = createClient(globalConfigConnectionString(), {
-    cache: 'no-store',
-    staleIfError: 0,
-    disableDevelopmentCache: true,
-  });
-  return cachedGlobalConfigClient;
-}
-
-async function globalConfigReadItems() {
-  const now = Date.now();
-  if (globalConfigReadCache && now - globalConfigReadCacheAt < 1000) {
-    return globalConfigReadCache;
-  }
-  if (globalConfigReadInflight) return globalConfigReadInflight;
-
-  globalConfigReadInflight = getGlobalConfigClient()
-    .getAll(STORAGE_FILES.map(globalConfigItemKey))
-    .then((items) => {
-      globalConfigReadCache = items && typeof items === 'object' ? items : {};
-      globalConfigReadCacheAt = Date.now();
-      return globalConfigReadCache;
-    })
-    .finally(() => {
-      globalConfigReadInflight = null;
-    });
-  return globalConfigReadInflight;
-}
-
-function globalConfigValueToText(value) {
-  if (typeof value === 'string') return value;
-  return JSON.stringify(value, null, 2);
-}
-
-function globalConfigBodyToValue(body) {
-  const text = Buffer.isBuffer(body) ? body.toString('utf8') : String(body);
-  try {
-    return JSON.parse(text);
-  } catch (e) {
-    return text;
-  }
-}
-
-async function globalConfigReadFile(name) {
-  const items = await globalConfigReadItems();
-  const key = globalConfigItemKey(name);
-  if (!Object.prototype.hasOwnProperty.call(items, key)) return null;
-  const text = globalConfigValueToText(items[key]);
-  return { text, etag: contentEtag(text) };
-}
-
-function globalConfigApiBaseUrls() {
-  const custom = String(process.env.GLOBAL_CONFIG_API_BASE_URL || '')
-    .trim()
-    .replace(/\/+$/, '');
-  if (custom) return [{ url: custom, api: 'custom' }];
-  return [
-    { url: 'https://api.vercel.com/v1/global-config', api: 'global-config' },
-    // Global Config 是 Edge Config 的新名称；旧端点作为兼容回退。
-    { url: 'https://api.vercel.com/v1/edge-config', api: 'edge-config' },
-  ];
-}
-
-function globalConfigOidcOwnerId() {
-  const token = String(process.env.VERCEL_OIDC_TOKEN || '').trim();
-  if (!token) return '';
-  try {
-    const part = token.split('.')[1];
-    if (!part) return '';
-    const normalized = part.replace(/-/g, '+').replace(/_/g, '/');
-    const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4);
-    const payload = JSON.parse(Buffer.from(padded, 'base64').toString('utf8'));
-    return String((payload && payload.owner_id) || '').trim();
-  } catch (e) {
-    return '';
-  }
-}
-
-function globalConfigScopeCandidates() {
-  const candidates = [];
-  const seen = new Set();
-  const add = (param, value, source) => {
-    const v = String(value || '').trim();
-    const key = `${param || 'none'}:${v}`;
-    if ((!param || v) && !seen.has(key)) {
-      seen.add(key);
-      candidates.push({ param, value: v, source });
-    }
-  };
-
-  add('teamId', process.env.GLOBAL_CONFIG_TEAM_ID, 'GLOBAL_CONFIG_TEAM_ID');
-  add('teamId', process.env.VERCEL_TEAM_ID, 'VERCEL_TEAM_ID');
-  add('teamId', globalConfigOidcOwnerId(), 'OIDC owner_id');
-  add('teamId', process.env.VERCEL_ORG_ID, 'VERCEL_ORG_ID');
-  add('slug', process.env.GLOBAL_CONFIG_TEAM_SLUG, 'GLOBAL_CONFIG_TEAM_SLUG');
-  add(null, '', 'personal account');
-  return candidates;
-}
-
-function globalConfigWriteTargets() {
-  const targets = [];
-  const seen = new Set();
-  const add = (target) => {
-    if (!target) return;
-    const key = `${target.baseUrl}|${target.param || ''}|${target.value || ''}`;
-    if (!seen.has(key)) {
-      seen.add(key);
-      targets.push(target);
-    }
-  };
-  add(cachedGlobalConfigWriteTarget);
-  for (const base of globalConfigApiBaseUrls()) {
-    for (const scope of globalConfigScopeCandidates()) {
-      add({
-        baseUrl: base.url,
-        api: base.api,
-        param: scope.param,
-        value: scope.value,
-        scopeSource: scope.source,
-      });
-    }
-  }
-  return targets;
-}
-
-function globalConfigSmartOperations(values) {
-  const current = globalConfigReadCache || {};
-  return Object.entries(values).map(([key, value]) => ({
-    operation: Object.prototype.hasOwnProperty.call(current, key)
-      ? 'update'
-      : 'create',
-    key,
-    value,
-  }));
-}
-
-async function globalConfigPatchTarget(target, items) {
-  const url = new URL(
-    `${target.baseUrl}/${encodeURIComponent(globalConfigId())}/items`,
-  );
-  if (target.param && target.value) {
-    url.searchParams.set(target.param, target.value);
-  }
-  const response = await fetch(url, {
-    method: 'PATCH',
-    headers: {
-      Authorization: `Bearer ${globalConfigWriteToken()}`,
-      'Content-Type': 'application/json',
-      'User-Agent': 'sub-store-vercel',
-    },
-    body: JSON.stringify({ items }),
-  });
-  const responseText = await response.text();
-  let result = null;
-  try {
-    result = responseText ? JSON.parse(responseText) : null;
-  } catch (e) {}
-  const message =
-    (result && result.error && (result.error.message || result.error.code)) ||
-    responseText.slice(0, 300) ||
-    `HTTP ${response.status}`;
-  return {
-    ok: response.ok && !(result && result.error),
-    status: response.status,
-    message,
-  };
-}
-
-async function globalConfigPutFiles(files) {
-  if (!globalConfigConfigured()) {
-    throw new Error(
-      `Global Config 配置不完整: ${globalConfigMissingEnv().join(', ')}`,
-    );
-  }
-
-  const values = {};
-  for (const file of files) {
-    values[globalConfigItemKey(file.name)] = globalConfigBodyToValue(file.body);
-  }
-  const payloadBytes = Buffer.byteLength(JSON.stringify(values));
-  // Global Config 每个 Store 上限 1 MB；预留键名及其它元数据空间。
-  if (payloadBytes > 950 * 1024) {
-    throw new Error(
-      `Global Config 数据过大 (${payloadBytes} bytes)，请改用 Cloudflare R2`,
-    );
-  }
-
-  const baseItems = globalConfigSmartOperations(values);
-  const attempts = [];
-  let successfulTarget = null;
-  let successfulOperations = null;
-  let last = { status: 0, message: 'no write target' };
-
-  for (const target of globalConfigWriteTargets()) {
-    let items = baseItems;
-    let response = await globalConfigPatchTarget(target, items);
-    attempts.push({
-      api: target.api,
-      scope: target.scopeSource,
-      status: response.status,
-    });
-
-    // SDK 缓存可能比写入 API 慢：update 找不到时改 create，create 冲突时改 update。
-    if (
-      !response.ok &&
-      response.status === 404 &&
-      items.some((item) => item.operation === 'update')
-    ) {
-      items = items.map((item) => ({ ...item, operation: 'create' }));
-      response = await globalConfigPatchTarget(target, items);
-      attempts.push({
-        api: target.api,
-        scope: `${target.scopeSource} (create retry)`,
-        status: response.status,
-      });
-    } else if (
-      !response.ok &&
-      (response.status === 400 || response.status === 409) &&
-      items.some((item) => item.operation === 'create')
-    ) {
-      items = items.map((item) => ({ ...item, operation: 'update' }));
-      response = await globalConfigPatchTarget(target, items);
-      attempts.push({
-        api: target.api,
-        scope: `${target.scopeSource} (update retry)`,
-        status: response.status,
-      });
-    }
-
-    last = response;
-    if (response.ok) {
-      successfulTarget = target;
-      successfulOperations = Array.from(
-        new Set(items.map((item) => item.operation)),
-      );
-      break;
-    }
-    // 401 表示 Token 本身无效，继续尝试其它 scope/端点也不会成功。
-    if (response.status === 401) break;
-  }
-
-  if (!successfulTarget) {
-    cachedGlobalConfigWriteTarget = null;
-    lastGlobalConfigWriteDiagnostic = {
-      ok: false,
-      status: last.status,
-      message: last.message,
-      attempts,
-    };
-    throw new Error(
-      `Global Config 写入失败 (${last.status}): ${last.message}; ` +
-        `已尝试 ${attempts.length} 个 API/scope 组合`,
-    );
-  }
-
-  cachedGlobalConfigWriteTarget = successfulTarget;
-  lastGlobalConfigWriteDiagnostic = {
-    ok: true,
-    api: successfulTarget.api,
-    scope: successfulTarget.scopeSource,
-    operations: successfulOperations,
-    attempts,
-  };
-  globalConfigReadCache = {
-    ...(globalConfigReadCache || {}),
-    ...values,
-  };
-  globalConfigReadCacheAt = Date.now();
-  const etags = {};
-  for (const file of files) {
-    etags[file.name] = contentEtag(
-      globalConfigValueToText(values[globalConfigItemKey(file.name)]),
-    );
-  }
-  return { etags, bytes: payloadBytes };
-}
-
-async function globalConfigPutFile(name, body) {
-  const result = await globalConfigPutFiles([{ name, body }]);
-  return { etag: result.etags[name], bytes: result.bytes };
-}
-
 async function vercelBlobPutFile(name, body) {
   const { put } = require('@vercel/blob');
   const pathname = storageKey(name);
@@ -1248,18 +819,12 @@ async function vercelBlobReadFile(name) {
 async function storagePutFile(name, body) {
   const provider = storageProvider();
   if (provider === 'cloudflare-r2') return r2PutFile(name, body);
-  if (provider === 'vercel-global-config') {
-    return globalConfigPutFile(name, body);
-  }
   if (provider === 'vercel-blob') return vercelBlobPutFile(name, body);
-  throw new Error('未配置共享存储');
+  throw new Error('未配置共享对象存储');
 }
 
 async function storageReadFile(name) {
   const provider = storageProvider();
-  if (provider === 'vercel-global-config') {
-    return globalConfigReadFile(name);
-  }
   if (provider === 'vercel-blob') return vercelBlobReadFile(name);
   if (provider !== 'cloudflare-r2') return null;
 
@@ -1287,46 +852,22 @@ async function flushDataDirToStorage() {
   storageFlushInflight = (async () => {
     const dir = process.env.SUB_STORE_DATA_BASE_PATH;
     const written = new Set();
-    let globalConfigBytes = null;
     // 上传过程中如果配置再次被修改，再循环一次，避免后写入的数据丢失。
     do {
       storageDirty = false;
-      const files = [];
       for (const name of STORAGE_FILES) {
         const fp = path.join(dir, name);
         if (!fs.existsSync(fp)) continue;
-        files.push({ name, body: fs.readFileSync(fp) });
-      }
-
-      if (provider === 'vercel-global-config' && files.length) {
-        // 两个文件合并成一次 PATCH，减少 Global Config 写入次数。
-        const result = await globalConfigPutFiles(files);
-        globalConfigBytes = result.bytes;
-        for (const file of files) written.add(file.name);
-        if (result.etags['sub-store.json']) {
-          storageLastEtag = result.etags['sub-store.json'];
-        }
-      } else {
-        for (const file of files) {
-          const result = await storagePutFile(file.name, file.body);
-          written.add(file.name);
-          if (file.name === 'sub-store.json' && result && result.etag) {
-            storageLastEtag = cleanEtag(result.etag);
-          }
-        }
+        await storagePutFile(name, fs.readFileSync(fp));
+        written.add(name);
       }
     } while (storageDirty);
 
-    storageLastPutAt = Date.now();
     lastStorageStatus = {
       configured: true,
       provider,
-      lastPut: storageLastPutAt,
+      lastPut: Date.now(),
       files: Array.from(written),
-      ...(globalConfigBytes == null ? {} : { bytes: globalConfigBytes }),
-      ...(provider === 'vercel-global-config'
-        ? { propagation: 'up to 10 seconds' }
-        : {}),
       ...(storageMigratedFrom ? { migratedFrom: storageMigratedFrom } : {}),
     };
     return lastStorageStatus;
@@ -1392,20 +933,10 @@ function flushStorageBeforeResponseEnd(res) {
 async function hydrateFromStorage() {
   const provider = storageProvider();
   if (!provider) {
-    const requested = requestedStorageProvider();
-    let missingEnv = [];
-    if (requested === 'cloudflare-r2') {
-      missingEnv = r2MissingEnv();
-    } else if (requested === 'vercel-global-config') {
-      missingEnv = globalConfigMissingEnv();
-    } else if (requested === 'auto' && r2HasAnyConfig()) {
-      missingEnv = r2MissingEnv();
-    }
     lastStorageStatus = {
       configured: false,
       provider: null,
-      requestedProvider: requested,
-      ...(missingEnv.length ? { missingEnv } : {}),
+      ...(r2HasAnyConfig() ? { missingEnv: r2MissingEnv() } : {}),
     };
     return lastStorageStatus;
   }
@@ -1440,15 +971,9 @@ async function hydrateFromStorage() {
 }
 
 async function pullStorageIntoMemory() {
-  if (!storageConfigured()) return { skipped: 'no shared storage' };
+  if (!storageConfigured()) return { skipped: 'no object storage' };
   if (storagePullInflight) return storagePullInflight;
   if (Date.now() - storagePullAt < 1500) return { skipped: 'throttled' };
-  if (
-    storageProvider() === 'vercel-global-config' &&
-    Date.now() - storageLastPutAt < 10000
-  ) {
-    return { skipped: 'waiting for Global Config propagation' };
-  }
 
   storagePullInflight = (async () => {
     const r = await storageReadFile('sub-store.json');
@@ -1595,7 +1120,7 @@ module.exports = async function handler(req, res) {
     capturedApp.__gistSyncInstalled = true;
   }
 
-  // 写请求返回前等待 R2 / Global Config / Blob 写入完成，避免 Serverless 提前冻结。
+  // 写请求返回前等待 R2/Blob 上传完成，避免 Serverless 在定时器执行前冻结。
   flushStorageBeforeResponseEnd(res);
 
   try {

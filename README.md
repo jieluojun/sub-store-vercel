@@ -1,6 +1,6 @@
 # Sub-Store · Vercel 一键部署
 
-[Sub-Store](https://github.com/sub-store-org/Sub-Store)（订阅管理/格式转换）的 Vercel 部署封装：**前后端同域名、Cloudflare R2 / Vercel Global Config 持久化、域名固定、自动升级**。全部网页操作，手机电脑均可，无需任何本地软件。
+[Sub-Store](https://github.com/sub-store-org/Sub-Store)（订阅管理/格式转换）的 Vercel 部署封装：**前后端同域名、Cloudflare R2 持久化、域名固定、自动升级**。全部网页操作，手机电脑均可，无需任何本地软件。
 
 ## 🚀 一键部署
 
@@ -70,45 +70,9 @@
    }
    ```
 
-   自动模式的存储优先级为 **R2 → Global Config（配置写 Token 后）→ Vercel Blob**。只要填写了任意一个 R2 变量但配置不完整，程序不会静默回退；自检中的 `r2MissingEnv` 会列出缺少的变量。
+   R2 配置优先级高于 Vercel Blob。只要填写了任意一个 R2 变量但配置不完整，程序不会静默退回 Blob；自检中的 `r2MissingEnv` 会列出缺少的变量。
 
-3. **可选：使用 Vercel Global Config 存储**
-
-   Global Config（原 Edge Config）适合**读取频繁、修改较少**的配置。每个 Store 最大 1 MB，写入后全球同步最长可能需要约 10 秒；如果数据接近 1 MB 或经常修改，仍建议使用 R2。
-
-   1. Vercel 项目 → **Storage → Create Database → Global Config**，创建并连接到当前项目。连接后 Vercel 会自动添加 `GLOBAL_CONFIG` 环境变量。
-   2. 在 Vercel 的 API Token 页面创建一个有权访问该账户/Team 的 Token，并在项目环境变量中添加 `GLOBAL_CONFIG_WRITE_TOKEN`。Global Config 自动生成的连接字符串只能读取，写入必须使用 API Token。
-   3. 添加 `SUB_STORE_STORAGE_PROVIDER=global-config`，然后重新部署。
-   4. 新版会从 Vercel OIDC 的 `owner_id` 自动识别 Team，并在新旧 API 端点间回退。通常不必手动填写 Team ID；如需覆盖，可添加 `GLOBAL_CONFIG_TEAM_ID=team_xxx` 或 `GLOBAL_CONFIG_TEAM_SLUG=团队slug`。
-
-   | 环境变量 | 填写内容 | 必填 |
-   | --- | --- | --- |
-   | `SUB_STORE_STORAGE_PROVIDER` | `global-config` | 是 |
-   | `GLOBAL_CONFIG` | 连接 Store 后由 Vercel 自动添加 | 是 |
-   | `GLOBAL_CONFIG_WRITE_TOKEN` | Vercel API Token，请保存为 Secret | 是 |
-   | `GLOBAL_CONFIG_TEAM_ID` | Store 所属 Team ID；通常由 OIDC 自动识别 | 否 |
-   | `GLOBAL_CONFIG_TEAM_SLUG` | Team URL 中的 slug，可替代 Team ID | 否 |
-   | `GLOBAL_CONFIG_ID` | `ecfg_...`；通常可从连接字符串自动识别 | 否 |
-   | `GLOBAL_CONFIG_ITEM_PREFIX` | 键名前缀，默认 `sub_store` | 否 |
-
-   数据保存为两个 Item：`sub_store_data` 和 `sub_store_root`。建议使用专用 Store，不要和其它应用配置混用。配置成功后，自检应包含：
-
-   ```json
-   {
-     "objectStorageConfigured": true,
-     "objectStorageProvider": "vercel-global-config",
-     "globalConfigConfigured": true,
-     "globalConfigWriteDiagnostic": {
-       "ok": true
-     }
-   }
-   ```
-
-   程序会把两个文件合并为一次 PATCH，以减少写入次数；首次使用 `create`，后续使用 `update`，并自动尝试正确的 Team scope 与新旧 API 端点。旧的 `EDGE_CONFIG` 连接字符串也兼容。不要将 `GLOBAL_CONFIG_WRITE_TOKEN` 提交到 GitHub，或添加 `NEXT_PUBLIC_` 前缀。
-
-   **迁移现有数据到 Global Config：**先在面板生成最新 Gist 备份并设置 `SUB_STORE_DATA_URL`，然后启用上述 Global Config 环境变量并重新部署。Store 为空时，Gist 恢复的数据会自动写入 Global Config。
-
-4. **从 Vercel Blob 迁移到 R2**
+3. **从 Vercel Blob 迁移到 R2**
    1. 迁移前先在面板的 **我的 → 数据管理/同步** 中做一次 Gist 备份。
    2. 暂时保留项目原来的 Blob 连接和 `BLOB_READ_WRITE_TOKEN`，再添加上述四个 R2 变量并重新部署。
    3. 如果 R2 中没有数据，程序会尝试从旧 Blob 读取并一次性复制到 R2；自检的 `objectStorageStatus.migratedFrom` 会显示 `vercel-blob`。
@@ -117,18 +81,18 @@
 
    如果 Blob 已经无法读取，可使用下面的 Gist 备份还原；R2 为空时，从 Gist 恢复的数据会自动写入 R2。
 
-5. **Gist 作为额外备份/灾难恢复**
+4. **Gist 作为额外备份/灾难恢复**
    1. 打开面板 → **我的** → **数据管理/同步** → 选 **Gist** → 填 GitHub Token（[点此创建](https://github.com/settings/tokens/new)，勾 **gist** 权限即可）→ **保存并同步/上传**；
    2. 浏览器打开 [gist.github.com](https://gist.github.com) 找到刚生成的备份 → 点 **Raw** → 复制地址栏 URL（形如 `https://gist.githubusercontent.com/用户名/<id>/raw/xxx.json`）；
    3. Vercel → **Settings → Environment Variables** 添加 `SUB_STORE_DATA_URL` = 刚复制的 Raw URL → **Deployments → Redeploy**。
 
-   有共享存储数据时以共享存储为准；存储为空或未配置时，`SUB_STORE_DATA_URL` 可用于冷启动恢复。Raw URL 等同于备份内容，请勿泄露。
+   有 R2 数据时以 R2 为准；R2 为空或未配置共享存储时，`SUB_STORE_DATA_URL` 可用于冷启动恢复。Raw URL 等同于备份内容，请勿泄露。
 
-6. **兼容 Vercel Blob**：未选择 R2 或 Global Config 时，原来的 Blob 逻辑仍然有效，方便平滑迁移。
+5. **兼容 Vercel Blob**：未配置任何 R2 变量时，原来的 `BLOB_READ_WRITE_TOKEN` 逻辑仍然有效，方便平滑迁移；新部署建议直接使用 R2。
 
-7. **国内访问** `*.vercel.app` 空白：挂代理，或在 Settings → Domains 绑定自有域名。
+6. **国内访问** `*.vercel.app` 空白：挂代理，或在 Settings → Domains 绑定自有域名。
 
-8. **排查**：检查 `__substore_selftest` 的 JSON。重点查看 `objectStorageRequestedProvider`、`objectStorageProvider`、`objectStorageStatus`、`globalConfigMissingEnv`、`r2MissingEnv` 和 `recentErrors`。
+7. **排查**：检查 `__substore_selftest` 的 JSON。重点查看 `objectStorageProvider`、`objectStorageStatus`、`r2MissingEnv` 和 `recentErrors`。
 
 ## 📁 文件说明
 
@@ -139,6 +103,5 @@
 | `version.json` | 当前版本记录（升级对比依据） |
 | `update.yml` | Actions 自动升级（移入 `.github/workflows/` 生效） |
 | `vercel.json` / `package*.json` | 构建路由配置 / 依赖清单 |
-| `.env.example` | R2、Global Config、Gist 环境变量示例 |
 
 本项目为 GPL-3.0 官方 Sub-Store 的部署封装，版权归原作者所有。

@@ -2,7 +2,7 @@
   "name": "sub-store-vercel-flat",
   "version": "2.36.38",
   "private": true,
-  "description": "Sub-Store 一键部署到 Vercel（同域名 + R2 / Global Config 持久化）| 后端 2.36.40 + 前端 2.29.10",
+  "description": "Sub-Store 一键部署到 Vercel（前后端同域名 + Cloudflare R2 持久化）| 后端 2.36.40 + 前端 2.29.10",
   "license": "GPL-3.0",
   "engines": {
     "node": ">=20"
@@ -15,7 +15,6 @@
     "@aws-sdk/client-s3": "^3.1118.0",
     "@maxmind/geoip2-node": "^5.0.0",
     "@vercel/blob": "^2.0.0",
-    "@vercel/global-config": "^1.5.1",
     "body-parser": "^1.19.0",
     "connect-history-api-fallback": "^2.0.0",
     "core-js": "^3.49.0",
