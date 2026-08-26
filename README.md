@@ -79,14 +79,15 @@
    1. Vercel 项目 → **Storage → Create Database → Global Config**，创建并连接到当前项目。连接后 Vercel 会自动添加 `GLOBAL_CONFIG` 环境变量。
    2. 在 Vercel 的 API Token 页面创建一个有权访问该账户/Team 的 Token，并在项目环境变量中添加 `GLOBAL_CONFIG_WRITE_TOKEN`。Global Config 自动生成的连接字符串只能读取，写入必须使用 API Token。
    3. 添加 `SUB_STORE_STORAGE_PROVIDER=global-config`，然后重新部署。
-   4. 如果 Store 属于 Team 且写入提示无权限，再添加 `GLOBAL_CONFIG_TEAM_ID=team_xxx`。
+   4. 新版会从 Vercel OIDC 的 `owner_id` 自动识别 Team，并在新旧 API 端点间回退。通常不必手动填写 Team ID；如需覆盖，可添加 `GLOBAL_CONFIG_TEAM_ID=team_xxx` 或 `GLOBAL_CONFIG_TEAM_SLUG=团队slug`。
 
    | 环境变量 | 填写内容 | 必填 |
    | --- | --- | --- |
    | `SUB_STORE_STORAGE_PROVIDER` | `global-config` | 是 |
    | `GLOBAL_CONFIG` | 连接 Store 后由 Vercel 自动添加 | 是 |
    | `GLOBAL_CONFIG_WRITE_TOKEN` | Vercel API Token，请保存为 Secret | 是 |
-   | `GLOBAL_CONFIG_TEAM_ID` | Store 所属 Team ID | Team 项目按需 |
+   | `GLOBAL_CONFIG_TEAM_ID` | Store 所属 Team ID；通常由 OIDC 自动识别 | 否 |
+   | `GLOBAL_CONFIG_TEAM_SLUG` | Team URL 中的 slug，可替代 Team ID | 否 |
    | `GLOBAL_CONFIG_ID` | `ecfg_...`；通常可从连接字符串自动识别 | 否 |
    | `GLOBAL_CONFIG_ITEM_PREFIX` | 键名前缀，默认 `sub_store` | 否 |
 
@@ -96,11 +97,14 @@
    {
      "objectStorageConfigured": true,
      "objectStorageProvider": "vercel-global-config",
-     "globalConfigConfigured": true
+     "globalConfigConfigured": true,
+     "globalConfigWriteDiagnostic": {
+       "ok": true
+     }
    }
    ```
 
-   程序会把两个文件合并为一次 PATCH，以减少写入次数。旧的 `EDGE_CONFIG` 连接字符串也兼容。不要将 `GLOBAL_CONFIG_WRITE_TOKEN` 提交到 GitHub，或添加 `NEXT_PUBLIC_` 前缀。
+   程序会把两个文件合并为一次 PATCH，以减少写入次数；首次使用 `create`，后续使用 `update`，并自动尝试正确的 Team scope 与新旧 API 端点。旧的 `EDGE_CONFIG` 连接字符串也兼容。不要将 `GLOBAL_CONFIG_WRITE_TOKEN` 提交到 GitHub，或添加 `NEXT_PUBLIC_` 前缀。
 
    **迁移现有数据到 Global Config：**先在面板生成最新 Gist 备份并设置 `SUB_STORE_DATA_URL`，然后启用上述 Global Config 环境变量并重新部署。Store 为空时，Gist 恢复的数据会自动写入 Global Config。
 
