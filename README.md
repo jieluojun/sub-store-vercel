@@ -1,6 +1,6 @@
 # Sub-Store · Vercel 一键部署
 
-[Sub-Store](https://github.com/sub-store-org/Sub-Store)（订阅管理/格式转换）的 Vercel 部署封装：**前后端同域名、Cloudflare R2 持久化、域名固定、自动升级**。全部网页操作，手机电脑均可，无需任何本地软件。
+[Sub-Store](https://github.com/sub-store-org/Sub-Store)（订阅管理/格式转换）的 Vercel 部署封装：**前后端同域名、GitHub 私有仓库持久化、域名固定、自动升级**。全部网页操作，手机电脑均可，无需任何本地软件。
 
 ## 🚀 一键部署
 
@@ -34,25 +34,25 @@
 
 1. **务必自设私密路径**（部署时的环境变量），否则节点信息可能暴露。
 
-2. **推荐：Cloudflare R2 作为共享主存储**
+2. **推荐：GitHub 私有仓库作为共享主存储**
 
-   `/tmp` 在每个 Lambda 中相互独立，重新部署后也会清空；R2 是所有实例共用的持久对象存储。本仓库会自动把 `sub-store.json` 和 `root.json` 保存到 R2，并在冷启动时恢复。
+   `/tmp` 在每个 Lambda 中相互独立，重新部署后也会清空；私有仓库是所有实例共用的持久存储。本仓库会自动把 `sub-store.json` 和 `root.json` 通过 GitHub Contents API 提交到你的私有仓库，并在冷启动/每次请求时拉取最新数据。数据带完整 commit 历史，误删可回滚，还不占用 R2 免费额度。
 
-   **Cloudflare 端：**
-   1. 进入 Cloudflare 控制台 → **R2 Object Storage** → 新建一个存储桶，例如 `sub-store`；存储桶不需要开放公共访问。
-   2. 在 R2 的 API Token 管理页面创建 Token，权限选择 **Object Read & Write**，最好只授权刚创建的存储桶。
-   3. 保存页面给出的 **Access Key ID** 和 **Secret Access Key**；Secret 通常只显示一次。
+   **GitHub 端：**
+   1. 新建一个**私有**仓库，例如 `sub-store-data`（⚠️ 必须是**独立的**数据仓库，**不要**用 Vercel 正在部署的代码仓库——每次保存数据都会产生 commit，指向部署仓库会让 Vercel 不停重新部署）。创建时勾选 **Add a README** 保证仓库非空。
+   2. 创建 Token（二选一）：
+      - [Classic Token](https://github.com/settings/tokens/new)：勾选 **repo** 权限（私有库必须）；
+      - Fine-grained Token：只授权该仓库，权限给 **Contents: Read and write**。
 
    **Vercel 端：**进入项目 → **Settings → Environment Variables**，添加以下变量并重新部署：
 
    | 环境变量 | 填写内容 | 必填 |
    | --- | --- | --- |
-   | `R2_ACCOUNT_ID` | Cloudflare Account ID | 是 |
-   | `R2_ACCESS_KEY_ID` | R2 API Token 的 Access Key ID | 是 |
-   | `R2_SECRET_ACCESS_KEY` | R2 API Token 的 Secret Access Key | 是 |
-   | `R2_BUCKET_NAME` | 存储桶名称，例如 `sub-store` | 是 |
-   | `R2_ENDPOINT` | 自定义 S3 端点；不填时根据 Account ID 自动生成 | 否 |
-   | `R2_PREFIX` | 对象目录，默认 `sub-store-data/` | 否 |
+   | `GITHUB_REPO_USER` | GitHub 用户名（或组织名） | `GITHUB_REPO_NAME` 为 `owner/repo` 形式时可省略 |
+   | `GITHUB_REPO_TOKEN` | 上一步创建的 Token | 是 |
+   | `GITHUB_REPO_NAME` | 仓库名称，纯名称 / `owner/repo` / 完整 URL 均可 | 是 |
+   | `GITHUB_REPO_BRANCH` | 存储分支，不填 = 仓库默认分支 | 否 |
+   | `SUB_STORE_STORAGE_PREFIX` | 仓库内存储目录，默认 `sub-store-data/` | 否 |
 
    不要给变量名添加 `NEXT_PUBLIC_`，也不要把密钥提交到 GitHub。配置完成后访问：
 
@@ -65,34 +65,31 @@
    ```json
    {
      "objectStorageConfigured": true,
-     "objectStorageProvider": "cloudflare-r2",
-     "r2Configured": true
+     "objectStorageProvider": "github-repo",
+     "githubRepoConfigured": true
    }
    ```
 
-   R2 配置优先级高于 Vercel Blob。只要填写了任意一个 R2 变量但配置不完整，程序不会静默退回 Blob；自检中的 `r2MissingEnv` 会列出缺少的变量。
+   之后每次在面板保存订阅/配置，私有仓库的 `sub-store-data/` 目录下都会出现对应 commit，即为持久化成功。
 
-3. **从 Vercel Blob 迁移到 R2**
-   1. 迁移前先在面板的 **我的 → 数据管理/同步** 中做一次 Gist 备份。
-   2. 暂时保留项目原来的 Blob 连接和 `BLOB_READ_WRITE_TOKEN`，再添加上述四个 R2 变量并重新部署。
-   3. 如果 R2 中没有数据，程序会尝试从旧 Blob 读取并一次性复制到 R2；自检的 `objectStorageStatus.migratedFrom` 会显示 `vercel-blob`。
-   4. 在 R2 存储桶中确认出现 `sub-store-data/sub-store.json`（通常还会有 `root.json`），并在面板修改一次配置确认可以正常读写。
-   5. 确认成功后，可以从 Vercel 项目断开旧 Blob 存储。
+   **速率与额度说明**：读取走条件请求（内容未变时 304，不计入限额），写入才会产生 API 调用；Token 每小时 5000 次，日常使用绰绰有余。单文件超过 100MB 无法用此 API 提交（Sub-Store 配置通常只有几十 KB，无需担心）。
 
-   如果 Blob 已经无法读取，可使用下面的 Gist 备份还原；R2 为空时，从 Gist 恢复的数据会自动写入 R2。
+3. **从旧方案（R2 / Vercel Blob）换用 GitHub 仓库**
+
+   程序不会自动搬运旧存储里的数据。换用时：先在旧部署的面板 **我的 → 数据管理/同步** 做一次 Gist 备份 → 配置好 GitHub 仓库变量（可同时移除 R2/Blob 变量）并重新部署 → 按下面第 4 条设置 `SUB_STORE_DATA_URL`，冷启动会从 Gist 还原数据，之后在面板随便保存一次即写入私有仓库 → 确认 `sub-store-data/sub-store.json` 出现在私有仓库后，移除 `SUB_STORE_DATA_URL` 完成切换。
 
 4. **Gist 作为额外备份/灾难恢复**
    1. 打开面板 → **我的** → **数据管理/同步** → 选 **Gist** → 填 GitHub Token（[点此创建](https://github.com/settings/tokens/new)，勾 **gist** 权限即可）→ **保存并同步/上传**；
    2. 浏览器打开 [gist.github.com](https://gist.github.com) 找到刚生成的备份 → 点 **Raw** → 复制地址栏 URL（形如 `https://gist.githubusercontent.com/用户名/<id>/raw/xxx.json`）；
    3. Vercel → **Settings → Environment Variables** 添加 `SUB_STORE_DATA_URL` = 刚复制的 Raw URL → **Deployments → Redeploy**。
 
-   有 R2 数据时以 R2 为准；R2 为空或未配置共享存储时，`SUB_STORE_DATA_URL` 可用于冷启动恢复。Raw URL 等同于备份内容，请勿泄露。
+   有共享存储数据时以共享存储为准；存储为空或未配置共享存储时，`SUB_STORE_DATA_URL` 可用于冷启动恢复。Raw URL 等同于备份内容，请勿泄露。
 
-5. **兼容 Vercel Blob**：未配置任何 R2 变量时，原来的 `BLOB_READ_WRITE_TOKEN` 逻辑仍然有效，方便平滑迁移；新部署建议直接使用 R2。
+5. **兼容旧方案**：未配置任何 GitHub 仓库变量时，原来的 R2 / Vercel Blob（`BLOB_READ_WRITE_TOKEN`）逻辑仍然有效，方便平滑迁移；新部署建议直接使用 GitHub 私有仓库。
 
 6. **国内访问** `*.vercel.app` 空白：挂代理，或在 Settings → Domains 绑定自有域名。
 
-7. **排查**：检查 `__substore_selftest` 的 JSON。重点查看 `objectStorageProvider`、`objectStorageStatus`、`r2MissingEnv` 和 `recentErrors`。
+7. **排查**：检查 `__substore_selftest` 的 JSON。重点查看 `objectStorageProvider`、`objectStorageStatus`、`githubRepoMissingEnv` 和 `recentErrors`。
 
 ## 📁 文件说明
 

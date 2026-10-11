@@ -22,7 +22,7 @@ const path = require('path');
 const fs = require('fs');
 const zlib = require('zlib');
 
-const ENTRY_VERSION = 'v9-r2-object-storage-2026-08-26';
+const ENTRY_VERSION = 'v10-github-repo-storage-2026-10-12';
 
 /* ================= 默认配置 (可在 Vercel 环境变量中覆盖) ================= */
 
@@ -315,6 +315,8 @@ function selfTest(res) {
     objectStorageConfigured: storageConfigured(),
     objectStorageProvider: storageProvider(),
     objectStorageStatus: lastStorageStatus,
+    githubRepoConfigured: githubRepoConfigured(),
+    githubRepoMissingEnv: githubRepoHasAnyConfig() ? githubRepoMissingEnv() : [],
     r2Configured: r2Configured(),
     r2MissingEnv: r2HasAnyConfig() ? r2MissingEnv() : [],
     // 保留旧字段，方便已有排查脚本；这里仅表示 Vercel Blob 本身。
@@ -563,7 +565,7 @@ function installGistSync(app) {
     if (!shouldPullGist(reqPath)) return next();
     const method = (req.method || 'GET').toUpperCase();
     if (method !== 'GET' && method !== 'HEAD') return next();
-    // 有 R2 / Vercel Blob 时以共享存储为准，不再每次请求 Gist。
+    // 有共享存储 (GitHub 仓库/R2/Blob) 时以共享存储为准，不再每次请求 Gist。
     const pull = storageConfigured() ? pullStorageIntoMemory() : pullGistIntoMemory();
     Promise.resolve(pull)
       .then(() => next())
@@ -571,7 +573,7 @@ function installGistSync(app) {
   });
 }
 
-/* ---------- 共享对象存储：Cloudflare R2 优先，兼容 Vercel Blob ---------- */
+/* ---------- 共享存储: GitHub 私有仓库(主推) / Cloudflare R2 / Vercel Blob ---------- */
 
 const STORAGE_FILES = ['sub-store.json', 'root.json'];
 let storageLastEtag = '';
@@ -585,6 +587,212 @@ let storageHydrating = false;
 let storageMigratedFrom = null;
 let lastStorageStatus = { configured: false, provider: null };
 let cachedR2Client = null;
+
+/* ----------------------- GitHub 私有仓库存储 -----------------------
+ * 环境变量:
+ *   GITHUB_REPO_USER   GitHub 用户名 (或组织名)
+ *   GITHUB_REPO_NAME   仓库名称, 纯名称 / "owner/repo" / 完整 URL 均可
+ *   GITHUB_REPO_TOKEN  Personal Access Token
+ *                      · classic:        勾选 repo 权限 (私有库必须)
+ *                      · fine-grained:   该仓库 Contents: Read and write
+ * 可选:
+ *   GITHUB_REPO_BRANCH      存储分支, 不填 = 仓库默认分支
+ *   SUB_STORE_STORAGE_PREFIX / R2_PREFIX  仓库内的存储目录, 默认 sub-store-data/
+ *
+ * ⚠️ 强烈建议使用【独立的私有数据仓库】, 不要指向 Vercel 正在部署的代码仓库:
+ *    每次保存数据都会产生一个 commit, 指向部署仓库会导致 Vercel 频繁重新部署。
+ *
+ * 读写走 GitHub Contents API:
+ *   · 读: GET /repos/{slug}/contents/{path} (带 If-None-Match 条件请求,
+ *     未变化时返回 304, 不消耗 API 速率限额)
+ *   · 写: PUT /repos/{slug}/contents/{path} (自动携带 sha, 冲突时刷新重试)
+ * ------------------------------------------------------------------ */
+
+const githubShaCache = new Map(); // 存储路径 -> { sha, etag, text }
+
+function githubRepoToken() {
+  return String(process.env.GITHUB_REPO_TOKEN || '').trim();
+}
+
+// 仓库名称归一化: 去掉 https://github.com/ 前缀与 .git 后缀
+function githubRepoNameRaw() {
+  return String(process.env.GITHUB_REPO_NAME || '')
+    .trim()
+    .replace(/^https?:\/\/github\.com\//i, '')
+    .replace(/\.git$/i, '');
+}
+
+function githubRepoOwner() {
+  const name = githubRepoNameRaw();
+  if (name.includes('/')) return name.split('/')[0];
+  return String(process.env.GITHUB_REPO_USER || '').trim();
+}
+
+function githubRepoShortName() {
+  const name = githubRepoNameRaw();
+  return name.includes('/') ? name.split('/')[1] : name;
+}
+
+function githubRepoSlug() {
+  const owner = githubRepoOwner();
+  const repo = githubRepoShortName();
+  return owner && repo ? `${owner}/${repo}` : '';
+}
+
+function githubRepoBranch() {
+  return String(process.env.GITHUB_REPO_BRANCH || '').trim();
+}
+
+function githubRepoHasAnyConfig() {
+  return !!(
+    process.env.GITHUB_REPO_USER ||
+    process.env.GITHUB_REPO_NAME ||
+    process.env.GITHUB_REPO_TOKEN
+  );
+}
+
+function githubRepoMissingEnv() {
+  const missing = [];
+  if (!githubRepoToken()) missing.push('GITHUB_REPO_TOKEN');
+  if (!githubRepoSlug()) {
+    if (!process.env.GITHUB_REPO_NAME) {
+      missing.push('GITHUB_REPO_NAME (仓库名称)');
+    } else {
+      missing.push(
+        'GITHUB_REPO_USER (仓库名称不是 owner/repo 形式时必须提供用户名)',
+      );
+    }
+  }
+  return missing;
+}
+
+function githubRepoConfigured() {
+  return githubRepoMissingEnv().length === 0;
+}
+
+function encodeRepoPath(p) {
+  return String(p)
+    .split('/')
+    .filter(Boolean)
+    .map(encodeURIComponent)
+    .join('/');
+}
+
+async function githubApi(pathname, init) {
+  return fetch(`https://api.github.com${pathname}`, {
+    ...init,
+    headers: {
+      Accept: 'application/vnd.github+json',
+      Authorization: `Bearer ${githubRepoToken()}`,
+      'User-Agent': 'sub-store-vercel',
+      'X-GitHub-Api-Version': '2022-11-28',
+      ...(init && init.headers ? init.headers : {}),
+    },
+  });
+}
+
+async function githubRepoReadFile(name) {
+  const key = storageKey(name);
+  const cached = githubShaCache.get(key);
+  const ref = githubRepoBranch()
+    ? `?ref=${encodeURIComponent(githubRepoBranch())}`
+    : '';
+  const r = await githubApi(
+    `/repos/${githubRepoSlug()}/contents/${encodeRepoPath(key)}${ref}`,
+    {
+      headers: cached && cached.etag ? { 'If-None-Match': cached.etag } : {},
+    },
+  );
+  // 304 = 仓库内容未变化, 直接用本实例缓存 (不消耗速率限额)
+  if (r.status === 304 && cached) {
+    return { text: cached.text, etag: cached.sha };
+  }
+  if (r.status === 404) return null;
+  if (!r.ok) throw new Error(`GitHub contents API ${r.status} (${key})`);
+  const meta = await r.json();
+  let text;
+  if (meta.type === 'file' && meta.content && !meta.truncated) {
+    text = Buffer.from(
+      String(meta.content).replace(/\s+/g, ''),
+      'base64',
+    ).toString('utf8');
+  } else if (meta.type === 'file' && meta.sha) {
+    // >1MB 的文件 JSON 响应不带 content, 用 Git Blobs API 兜底 (上限 100MB)
+    const b = await githubApi(
+      `/repos/${githubRepoSlug()}/git/blobs/${meta.sha}`,
+      {},
+    );
+    if (!b.ok) throw new Error(`GitHub blobs API ${b.status} (${key})`);
+    const blob = await b.json();
+    if (blob.encoding !== 'base64' || !blob.content) return null;
+    text = Buffer.from(
+      String(blob.content).replace(/\s+/g, ''),
+      'base64',
+    ).toString('utf8');
+  } else {
+    return null;
+  }
+  const sha = String(meta.sha || '');
+  githubShaCache.set(key, {
+    sha,
+    etag: r.headers.get('etag') || (sha ? `"${sha}"` : ''),
+    text,
+  });
+  return { text, etag: sha };
+}
+
+async function githubRepoPutFile(name, body) {
+  const key = storageKey(name);
+  const slug = githubRepoSlug();
+  const branch = githubRepoBranch();
+  const payload = Buffer.isBuffer(body)
+    ? body
+    : Buffer.from(String(body), 'utf8');
+  const urlPath = `/repos/${slug}/contents/${encodeRepoPath(key)}`;
+
+  const attempt = (sha) =>
+    githubApi(urlPath, {
+      method: 'PUT',
+      body: JSON.stringify({
+        message: `sub-store: sync ${name} (${new Date().toISOString()})`,
+        content: payload.toString('base64'),
+        ...(branch ? { branch } : {}),
+        ...(sha ? { sha } : {}),
+      }),
+    });
+
+  const cached = githubShaCache.get(key);
+  let r = await attempt(cached ? cached.sha : null);
+
+  // 409/422: 文件已存在但未带 sha, 或 sha 过期 (其它实例先写入了) →
+  // 取服务端最新 sha 重试一次
+  if (r.status === 409 || r.status === 422) {
+    const cur = await githubApi(
+      urlPath + (branch ? `?ref=${encodeURIComponent(branch)}` : ''),
+      {},
+    );
+    const sha = cur.ok ? ((await cur.json()).sha || null) : null;
+    r = await attempt(sha);
+  }
+
+  if (!r.ok) {
+    let detail = '';
+    try {
+      detail = (await r.json()).message || '';
+    } catch (e) {}
+    throw new Error(`GitHub contents API ${r.status} (${key}): ${detail}`);
+  }
+  const j = await r.json();
+  const sha = String((j.content && j.content.sha) || '');
+  githubShaCache.set(key, {
+    sha,
+    etag: sha ? `"${sha}"` : '',
+    text: payload.toString('utf8'),
+  });
+  // 自己刚写入的数据即最新, 后续拉取可直接按 etag 跳过
+  if (name === 'sub-store.json' && sha) storageLastEtag = sha;
+  return { etag: sha };
+}
 
 function storagePrefix() {
   const raw = String(
@@ -646,7 +854,8 @@ function vercelBlobConfigured() {
 }
 
 function storageProvider() {
-  // 只要填写过任意 R2 变量，就不静默回退到 Blob；缺项会在自检中明确显示。
+  // 只要填写过任意 GitHub 仓库变量，就不静默回退；缺项会在自检中明确显示。
+  if (githubRepoHasAnyConfig()) return githubRepoConfigured() ? 'github-repo' : null;
   if (r2HasAnyConfig()) return r2Configured() ? 'cloudflare-r2' : null;
   if (vercelBlobConfigured()) return 'vercel-blob';
   return null;
@@ -818,6 +1027,7 @@ async function vercelBlobReadFile(name) {
 
 async function storagePutFile(name, body) {
   const provider = storageProvider();
+  if (provider === 'github-repo') return githubRepoPutFile(name, body);
   if (provider === 'cloudflare-r2') return r2PutFile(name, body);
   if (provider === 'vercel-blob') return vercelBlobPutFile(name, body);
   throw new Error('未配置共享对象存储');
@@ -825,6 +1035,7 @@ async function storagePutFile(name, body) {
 
 async function storageReadFile(name) {
   const provider = storageProvider();
+  if (provider === 'github-repo') return githubRepoReadFile(name);
   if (provider === 'vercel-blob') return vercelBlobReadFile(name);
   if (provider !== 'cloudflare-r2') return null;
 
@@ -933,10 +1144,15 @@ function flushStorageBeforeResponseEnd(res) {
 async function hydrateFromStorage() {
   const provider = storageProvider();
   if (!provider) {
+    const missingEnv = githubRepoHasAnyConfig()
+      ? githubRepoMissingEnv()
+      : r2HasAnyConfig()
+        ? r2MissingEnv()
+        : null;
     lastStorageStatus = {
       configured: false,
       provider: null,
-      ...(r2HasAnyConfig() ? { missingEnv: r2MissingEnv() } : {}),
+      ...(missingEnv ? { missingEnv } : {}),
     };
     return lastStorageStatus;
   }
@@ -1120,7 +1336,7 @@ module.exports = async function handler(req, res) {
     capturedApp.__gistSyncInstalled = true;
   }
 
-  // 写请求返回前等待 R2/Blob 上传完成，避免 Serverless 在定时器执行前冻结。
+  // 写请求返回前等待共享存储 (GitHub 仓库/R2/Blob) 上传完成，避免 Serverless 在定时器执行前冻结。
   flushStorageBeforeResponseEnd(res);
 
   try {
