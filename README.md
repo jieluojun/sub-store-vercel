@@ -87,9 +87,11 @@
 
 5. **兼容旧方案**：未配置任何 GitHub 仓库变量时，原来的 R2 / Vercel Blob（`BLOB_READ_WRITE_TOKEN`）逻辑仍然有效，方便平滑迁移；新部署建议直接使用 GitHub 私有仓库。
 
-6. **国内访问** `*.vercel.app` 空白：挂代理，或在 Settings → Domains 绑定自有域名。
+6. **自定义域名 / 任意前端**：已**完全去除 CORS 白名单拦截**——绑定任意自定义域名、或用任何第三方前端（官方在线版 `sub-store.vercel.app`、Stash 等）调用后端，均无需任何配置。⚠️ 因此**私密路径是后端唯一防线**，务必保持足够长的随机字符串；`SUB_STORE_CORS_ALLOWED_ORIGINS` 变量已无作用，无需设置。
 
-7. **排查**：检查 `__substore_selftest` 的 JSON。重点查看 `objectStorageProvider`、`objectStorageStatus`、`githubRepoMissingEnv` 和 `recentErrors`。
+7. **国内访问** `*.vercel.app` 空白：挂代理，或在 Settings → Domains 绑定自有域名。
+
+8. **排查**：检查 `__substore_selftest` 的 JSON。重点查看 `objectStorageProvider`、`objectStorageStatus`、`githubRepoMissingEnv` 和 `recentErrors`。
 
 ## 📁 文件说明
 

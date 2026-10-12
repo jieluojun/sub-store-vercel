@@ -22,7 +22,7 @@ const path = require('path');
 const fs = require('fs');
 const zlib = require('zlib');
 
-const ENTRY_VERSION = 'v10-github-repo-storage-2026-10-12';
+const ENTRY_VERSION = 'v10.2-open-cors-2026-10-12';
 
 /* ================= 默认配置 (可在 Vercel 环境变量中覆盖) ================= */
 
@@ -570,6 +570,47 @@ function installGistSync(app) {
     Promise.resolve(pull)
       .then(() => next())
       .catch(() => next());
+  });
+}
+
+/* ---------- 开放 CORS: 完全去除白名单拦截 ----------
+ * 官方后端默认按固定白名单校验 Origin, 绑定自定义域名或第三方前端
+ * 调用时全部 403。这里在请求进入后端前统一放通:
+ *   · OPTIONS 预检 (带 Access-Control-Request-Method) → 直接 204 返回
+ *     全放通响应头, 不再进入后端;
+ *   · 其余带 Origin 的请求 → 摘掉 Origin (后端按非 CORS 请求放行),
+ *     并给响应补 Access-Control-Allow-Origin: *, 让浏览器端能读到响应。
+ * ⚠️ 此后私密路径 (SUB_STORE_FRONTEND_BACKEND_PATH) 是后端唯一防线,
+ *    务必保持足够长的随机字符串。
+ */
+function installOpenCors(app) {
+  prependMiddleware(app, (req, res, next) => {
+    const origin = req.headers && req.headers.origin;
+    if (origin && typeof origin === 'string') {
+      if (
+        (req.method || '').toUpperCase() === 'OPTIONS' &&
+        req.headers['access-control-request-method'] !== undefined
+      ) {
+        res.statusCode = 204;
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader(
+          'Access-Control-Allow-Methods',
+          'GET,POST,PUT,PATCH,DELETE,OPTIONS,HEAD',
+        );
+        res.setHeader(
+          'Access-Control-Allow-Headers',
+          req.headers['access-control-request-headers'] || '*',
+        );
+        res.setHeader('Access-Control-Max-Age', '86400');
+        res.end();
+        return;
+      }
+      try {
+        delete req.headers.origin;
+      } catch (e) {}
+      res.setHeader('Access-Control-Allow-Origin', '*');
+    }
+    next();
   });
 }
 
@@ -1333,6 +1374,7 @@ module.exports = async function handler(req, res) {
 
   if (!capturedApp.__gistSyncInstalled) {
     installGistSync(capturedApp);
+    installOpenCors(capturedApp); // 置于最前: 预检请求不触发存储拉取
     capturedApp.__gistSyncInstalled = true;
   }
 
