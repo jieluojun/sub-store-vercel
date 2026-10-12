@@ -22,7 +22,7 @@ const path = require('path');
 const fs = require('fs');
 const zlib = require('zlib');
 
-const ENTRY_VERSION = 'v10.2-open-cors-2026-10-12';
+const ENTRY_VERSION = 'v10.3-fast-cold-start-2026-10-12';
 
 /* ================= 默认配置 (可在 Vercel 环境变量中覆盖) ================= */
 
@@ -258,8 +258,14 @@ try { require('http-proxy-middleware'); } catch (e) { warnLoad('http-proxy-middl
 try { require('connect-history-api-fallback'); } catch (e) { warnLoad('connect-history-api-fallback', e); }
 try { require('@maxmind/geoip2-node'); } catch (e) { warnLoad('@maxmind/geoip2-node', e); }
 try { require('core-js/actual/promise/with-resolvers'); } catch (e) { warnLoad('core-js', e); }
-try { require('@vercel/blob'); } catch (e) { warnLoad('@vercel/blob', e); }
-try { require('@aws-sdk/client-s3'); } catch (e) { warnLoad('@aws-sdk/client-s3', e); }
+// 大体积依赖仅在对应存储启用时才加载 (冷启动省 ~200ms);
+// require 字面量仍在代码中, nft 打包始终会包含这些依赖
+if (r2HasAnyConfig()) {
+  try { require('@aws-sdk/client-s3'); } catch (e) { warnLoad('@aws-sdk/client-s3', e); }
+}
+if (vercelBlobConfigured()) {
+  try { require('@vercel/blob'); } catch (e) { warnLoad('@vercel/blob', e); }
+}
 
 /* ------------------------ 启动 Sub-Store 后端 (延后到共享存储灌盘之后) ------------------------ */
 
@@ -720,8 +726,12 @@ function encodeRepoPath(p) {
 }
 
 async function githubApi(pathname, init) {
+  // 超时兜底: GitHub 偶发卡顿时快速失败, 拉取用旧数据兜底, 不拖死面板请求
+  const timeoutMs = (init && init.timeoutMs) || 6000;
+  const { timeoutMs: _drop, ...rest } = init || {};
   return fetch(`https://api.github.com${pathname}`, {
-    ...init,
+    ...rest,
+    signal: AbortSignal.timeout(timeoutMs),
     headers: {
       Accept: 'application/vnd.github+json',
       Authorization: `Bearer ${githubRepoToken()}`,
@@ -761,7 +771,7 @@ async function githubRepoReadFile(name) {
     // >1MB 的文件 JSON 响应不带 content, 用 Git Blobs API 兜底 (上限 100MB)
     const b = await githubApi(
       `/repos/${githubRepoSlug()}/git/blobs/${meta.sha}`,
-      {},
+      { timeoutMs: 15000 },
     );
     if (!b.ok) throw new Error(`GitHub blobs API ${b.status} (${key})`);
     const blob = await b.json();
@@ -1123,9 +1133,15 @@ async function flushDataDirToStorage() {
       ...(storageMigratedFrom ? { migratedFrom: storageMigratedFrom } : {}),
     };
     return lastStorageStatus;
-  })().finally(() => {
-    storageFlushInflight = null;
-  });
+  })()
+    .catch((e) => {
+      // 上传失败: 保留脏标记, 后续写请求会自动重试上传, 数据不丢
+      storageDirty = true;
+      throw e;
+    })
+    .finally(() => {
+      storageFlushInflight = null;
+    });
 
   return storageFlushInflight;
 }
@@ -1202,21 +1218,31 @@ async function hydrateFromStorage() {
   const got = [];
   storageHydrating = true;
   try {
-    for (const name of STORAGE_FILES) {
-      try {
-        const r = await storageReadFile(name);
-        if (r && r.text) {
-          fs.writeFileSync(path.join(dir, name), r.text);
-          got.push(name);
-          if (name === 'sub-store.json') storageLastEtag = r.etag || '';
+    // 两个数据文件并行拉取, 冷启动少一次 GitHub 往返
+    const results = await Promise.all(
+      STORAGE_FILES.map(async (name) => {
+        try {
+          const r = await storageReadFile(name);
+          if (r && r.text) {
+            fs.writeFileSync(path.join(dir, name), r.text);
+            return { name, etag: r.etag || '' };
+          }
+        } catch (e) {
+          pushError('storage-hydrate:' + name, e);
         }
-      } catch (e) {
-        pushError('storage-hydrate:' + name, e);
-      }
+        return null;
+      }),
+    );
+    for (const item of results) {
+      if (!item) continue;
+      got.push(item.name);
+      if (item.name === 'sub-store.json') storageLastEtag = item.etag || '';
     }
   } finally {
     storageHydrating = false;
   }
+  // hydrate 刚拉过即为最新, 打上节流标记, 避免首个请求立刻再拉一次
+  if (got.length) storagePullAt = Date.now();
   lastStorageStatus = {
     configured: true,
     provider,
