@@ -22,7 +22,7 @@ const path = require('path');
 const fs = require('fs');
 const zlib = require('zlib');
 
-const ENTRY_VERSION = 'v10.4-entry-no-cache-2026-10-12';
+const ENTRY_VERSION = 'v11-github-only-storage-2026-10-12';
 
 /* ================= 默认配置 (可在 Vercel 环境变量中覆盖) ================= */
 
@@ -258,14 +258,6 @@ try { require('http-proxy-middleware'); } catch (e) { warnLoad('http-proxy-middl
 try { require('connect-history-api-fallback'); } catch (e) { warnLoad('connect-history-api-fallback', e); }
 try { require('@maxmind/geoip2-node'); } catch (e) { warnLoad('@maxmind/geoip2-node', e); }
 try { require('core-js/actual/promise/with-resolvers'); } catch (e) { warnLoad('core-js', e); }
-// 大体积依赖仅在对应存储启用时才加载 (冷启动省 ~200ms);
-// require 字面量仍在代码中, nft 打包始终会包含这些依赖
-if (r2HasAnyConfig()) {
-  try { require('@aws-sdk/client-s3'); } catch (e) { warnLoad('@aws-sdk/client-s3', e); }
-}
-if (vercelBlobConfigured()) {
-  try { require('@vercel/blob'); } catch (e) { warnLoad('@vercel/blob', e); }
-}
 
 /* ------------------------ 启动 Sub-Store 后端 (延后到共享存储灌盘之后) ------------------------ */
 
@@ -323,11 +315,6 @@ function selfTest(res) {
     objectStorageStatus: lastStorageStatus,
     githubRepoConfigured: githubRepoConfigured(),
     githubRepoMissingEnv: githubRepoHasAnyConfig() ? githubRepoMissingEnv() : [],
-    r2Configured: r2Configured(),
-    r2MissingEnv: r2HasAnyConfig() ? r2MissingEnv() : [],
-    // 保留旧字段，方便已有排查脚本；这里仅表示 Vercel Blob 本身。
-    blobConfigured: vercelBlobConfigured(),
-    blobStatus: storageProvider() === 'vercel-blob' ? lastStorageStatus : { configured: vercelBlobConfigured() },
     gistSyncHookReady: typeof globalThis.__ssRestore === 'function',
     gistTokenConfigured: !!(
       process.env.SUB_STORE_GIST_TOKEN || process.env.GITHUB_TOKEN
@@ -571,7 +558,7 @@ function installGistSync(app) {
     if (!shouldPullGist(reqPath)) return next();
     const method = (req.method || 'GET').toUpperCase();
     if (method !== 'GET' && method !== 'HEAD') return next();
-    // 有共享存储 (GitHub 仓库/R2/Blob) 时以共享存储为准，不再每次请求 Gist。
+    // 有共享存储 (GitHub 仓库) 时以共享存储为准，不再每次请求 Gist。
     const pull = storageConfigured() ? pullStorageIntoMemory() : pullGistIntoMemory();
     Promise.resolve(pull)
       .then(() => next())
@@ -665,7 +652,7 @@ function installOpenCors(app) {
   });
 }
 
-/* ---------- 共享存储: GitHub 私有仓库(主推) / Cloudflare R2 / Vercel Blob ---------- */
+/* ---------- 共享存储: GitHub 私有仓库 ---------- */
 
 const STORAGE_FILES = ['sub-store.json', 'root.json'];
 let storageLastEtag = '';
@@ -676,9 +663,7 @@ let storageFlushInflight = null;
 let storageDirty = false;
 let storageFsHooked = false;
 let storageHydrating = false;
-let storageMigratedFrom = null;
 let lastStorageStatus = { configured: false, provider: null };
-let cachedR2Client = null;
 
 /* ----------------------- GitHub 私有仓库存储 -----------------------
  * 环境变量:
@@ -689,7 +674,7 @@ let cachedR2Client = null;
  *                      · fine-grained:   该仓库 Contents: Read and write
  * 可选:
  *   GITHUB_REPO_BRANCH      存储分支, 不填 = 仓库默认分支
- *   SUB_STORE_STORAGE_PREFIX / R2_PREFIX  仓库内的存储目录, 默认 sub-store-data/
+ *   SUB_STORE_STORAGE_PREFIX              仓库内的存储目录, 默认 sub-store-data/
  *
  * ⚠️ 强烈建议使用【独立的私有数据仓库】, 不要指向 Vercel 正在部署的代码仓库:
  *    每次保存数据都会产生一个 commit, 指向部署仓库会导致 Vercel 频繁重新部署。
@@ -892,9 +877,7 @@ async function githubRepoPutFile(name, body) {
 
 function storagePrefix() {
   const raw = String(
-    process.env.SUB_STORE_STORAGE_PREFIX ||
-      process.env.R2_PREFIX ||
-      'sub-store-data/',
+    process.env.SUB_STORE_STORAGE_PREFIX || 'sub-store-data/',
   )
     .trim()
     .replace(/^\/+|\/+$/g, '');
@@ -905,250 +888,13 @@ function storageKey(name) {
   return storagePrefix() + name;
 }
 
-function r2BucketName() {
-  return String(process.env.R2_BUCKET_NAME || process.env.R2_BUCKET || '').trim();
-}
-
-function r2Endpoint() {
-  const explicit = String(process.env.R2_ENDPOINT || '').trim().replace(/\/+$/, '');
-  if (explicit) return explicit;
-  const accountId = String(process.env.R2_ACCOUNT_ID || '').trim();
-  return accountId
-    ? `https://${accountId}.r2.cloudflarestorage.com`
-    : '';
-}
-
-function r2HasAnyConfig() {
-  return !!(
-    process.env.R2_ACCOUNT_ID ||
-    process.env.R2_ENDPOINT ||
-    process.env.R2_ACCESS_KEY_ID ||
-    process.env.R2_SECRET_ACCESS_KEY ||
-    process.env.R2_BUCKET_NAME ||
-    process.env.R2_BUCKET
-  );
-}
-
-function r2MissingEnv() {
-  const missing = [];
-  if (!r2Endpoint()) missing.push('R2_ACCOUNT_ID (or R2_ENDPOINT)');
-  if (!process.env.R2_ACCESS_KEY_ID) missing.push('R2_ACCESS_KEY_ID');
-  if (!process.env.R2_SECRET_ACCESS_KEY) missing.push('R2_SECRET_ACCESS_KEY');
-  if (!r2BucketName()) missing.push('R2_BUCKET_NAME');
-  return missing;
-}
-
-function r2Configured() {
-  return r2MissingEnv().length === 0;
-}
-
-function vercelBlobConfigured() {
-  return !!(
-    process.env.BLOB_READ_WRITE_TOKEN ||
-    process.env.VERCEL_OIDC_TOKEN
-  );
-}
-
 function storageProvider() {
-  // 只要填写过任意 GitHub 仓库变量，就不静默回退；缺项会在自检中明确显示。
-  if (githubRepoHasAnyConfig()) return githubRepoConfigured() ? 'github-repo' : null;
-  if (r2HasAnyConfig()) return r2Configured() ? 'cloudflare-r2' : null;
-  if (vercelBlobConfigured()) return 'vercel-blob';
-  return null;
+  // 仅支持 GitHub 私有仓库存储; 配置不完整时为 null, 缺项在自检中明确显示
+  return githubRepoConfigured() ? 'github-repo' : null;
 }
 
 function storageConfigured() {
   return !!storageProvider();
-}
-
-function blobTokenOpts() {
-  const token = process.env.BLOB_READ_WRITE_TOKEN;
-  return token ? { token } : {};
-}
-
-async function streamToString(stream) {
-  if (stream == null) return '';
-  if (typeof stream === 'string') return stream;
-  if (Buffer.isBuffer(stream)) return stream.toString('utf8');
-  if (typeof stream.text === 'function') return stream.text();
-  const chunks = [];
-  if (typeof stream.getReader === 'function') {
-    const reader = stream.getReader();
-    const dec = new TextDecoder();
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(
-        typeof value === 'string'
-          ? value
-          : dec.decode(value, { stream: true }),
-      );
-    }
-    return chunks.join('');
-  }
-  for await (const c of stream) chunks.push(Buffer.from(c));
-  return Buffer.concat(chunks).toString('utf8');
-}
-
-function cleanEtag(etag) {
-  return String(etag || '').replace(/^"|"$/g, '');
-}
-
-function getR2Client() {
-  if (cachedR2Client) return cachedR2Client;
-  if (!r2Configured()) {
-    throw new Error(`R2 配置不完整: ${r2MissingEnv().join(', ')}`);
-  }
-  // 当前锁定的 SDK 仍支持 Node 20；关闭其面向 2027 年的预告警，避免污染自检错误列表。
-  if (process.env.AWS_SDK_JS_NODE_VERSION_SUPPORT_WARNING_DISABLED === undefined) {
-    process.env.AWS_SDK_JS_NODE_VERSION_SUPPORT_WARNING_DISABLED = 'true';
-  }
-  const { S3Client } = require('@aws-sdk/client-s3');
-  cachedR2Client = new S3Client({
-    region: process.env.R2_REGION || 'auto',
-    endpoint: r2Endpoint(),
-    credentials: {
-      accessKeyId: process.env.R2_ACCESS_KEY_ID,
-      secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
-    },
-  });
-  return cachedR2Client;
-}
-
-async function r2PutFile(name, body) {
-  const { PutObjectCommand } = require('@aws-sdk/client-s3');
-  const payload = Buffer.isBuffer(body)
-    ? body
-    : Buffer.from(String(body), 'utf8');
-  const result = await getR2Client().send(
-    new PutObjectCommand({
-      Bucket: r2BucketName(),
-      Key: storageKey(name),
-      Body: payload,
-      ContentType: 'application/json; charset=utf-8',
-      CacheControl: 'no-store',
-    }),
-  );
-  return { etag: cleanEtag(result && result.ETag) };
-}
-
-function isObjectNotFound(e) {
-  const code = String((e && (e.name || e.Code || e.code)) || '');
-  const status = e && e.$metadata && e.$metadata.httpStatusCode;
-  return status === 404 || code === 'NoSuchKey' || code === 'NotFound';
-}
-
-async function r2ReadFile(name) {
-  const { GetObjectCommand } = require('@aws-sdk/client-s3');
-  try {
-    const result = await getR2Client().send(
-      new GetObjectCommand({
-        Bucket: r2BucketName(),
-        Key: storageKey(name),
-      }),
-    );
-    return {
-      text: await streamToString(result.Body),
-      etag: cleanEtag(result.ETag) || String(result.VersionId || ''),
-    };
-  } catch (e) {
-    if (isObjectNotFound(e)) return null;
-    throw e;
-  }
-}
-
-async function vercelBlobPutFile(name, body) {
-  const { put } = require('@vercel/blob');
-  const pathname = storageKey(name);
-  const payload = Buffer.isBuffer(body)
-    ? body
-    : Buffer.from(String(body), 'utf8');
-  const base = {
-    addRandomSuffix: false,
-    allowOverwrite: true,
-    contentType: 'application/json; charset=utf-8',
-    cacheControlMaxAge: 0,
-    ...blobTokenOpts(),
-  };
-  try {
-    return await put(pathname, payload, { ...base, access: 'private' });
-  } catch (e1) {
-    return put(pathname, payload, { ...base, access: 'public' });
-  }
-}
-
-async function vercelBlobReadFile(name) {
-  const blob = require('@vercel/blob');
-  const pathname = storageKey(name);
-  const opts = { ...blobTokenOpts(), access: 'private' };
-  if (typeof blob.get === 'function') {
-    try {
-      const r = await blob.get(pathname, opts);
-      if (!r || r.statusCode === 404) return null;
-      return {
-        text: await streamToString(r.stream || r),
-        etag: cleanEtag((r.blob && r.blob.etag) || r.etag),
-      };
-    } catch (e) {
-      try {
-        const r = await blob.get(pathname, {
-          ...blobTokenOpts(),
-          access: 'public',
-        });
-        if (!r || r.statusCode === 404) return null;
-        return {
-          text: await streamToString(r.stream || r),
-          etag: cleanEtag((r.blob && r.blob.etag) || r.etag),
-        };
-      } catch (e2) {
-        /* fall through to list */
-      }
-    }
-  }
-  const { blobs } = await blob.list({
-    prefix: pathname,
-    ...blobTokenOpts(),
-  });
-  const hit = (blobs || []).find((b) => b.pathname === pathname);
-  if (!hit) return null;
-  const res = await fetch(hit.url, {
-    headers: { 'Cache-Control': 'no-cache' },
-  });
-  if (!res.ok) return null;
-  return {
-    text: await res.text(),
-    etag: cleanEtag(hit.etag) || String(hit.uploadedAt || ''),
-  };
-}
-
-async function storagePutFile(name, body) {
-  const provider = storageProvider();
-  if (provider === 'github-repo') return githubRepoPutFile(name, body);
-  if (provider === 'cloudflare-r2') return r2PutFile(name, body);
-  if (provider === 'vercel-blob') return vercelBlobPutFile(name, body);
-  throw new Error('未配置共享对象存储');
-}
-
-async function storageReadFile(name) {
-  const provider = storageProvider();
-  if (provider === 'github-repo') return githubRepoReadFile(name);
-  if (provider === 'vercel-blob') return vercelBlobReadFile(name);
-  if (provider !== 'cloudflare-r2') return null;
-
-  const fromR2 = await r2ReadFile(name);
-  if (fromR2) return fromR2;
-
-  // 迁移辅助：R2 中还没有对象、旧 Blob Token 尚未移除时，从 Blob 读取并写入 R2。
-  // 只在 R2 缺少该对象时发生，迁移完成后不会继续消耗 Blob 请求。
-  if (process.env.BLOB_READ_WRITE_TOKEN) {
-    const fromBlob = await vercelBlobReadFile(name);
-    if (fromBlob && fromBlob.text) {
-      const copied = await r2PutFile(name, fromBlob.text);
-      storageMigratedFrom = 'vercel-blob';
-      return { text: fromBlob.text, etag: copied.etag || fromBlob.etag };
-    }
-  }
-  return null;
 }
 
 async function flushDataDirToStorage() {
@@ -1165,7 +911,7 @@ async function flushDataDirToStorage() {
       for (const name of STORAGE_FILES) {
         const fp = path.join(dir, name);
         if (!fs.existsSync(fp)) continue;
-        await storagePutFile(name, fs.readFileSync(fp));
+        await githubRepoPutFile(name, fs.readFileSync(fp));
         written.add(name);
       }
     } while (storageDirty);
@@ -1175,7 +921,6 @@ async function flushDataDirToStorage() {
       provider,
       lastPut: Date.now(),
       files: Array.from(written),
-      ...(storageMigratedFrom ? { migratedFrom: storageMigratedFrom } : {}),
     };
     return lastStorageStatus;
   })()
@@ -1248,9 +993,7 @@ async function hydrateFromStorage() {
   if (!provider) {
     const missingEnv = githubRepoHasAnyConfig()
       ? githubRepoMissingEnv()
-      : r2HasAnyConfig()
-        ? r2MissingEnv()
-        : null;
+      : null;
     lastStorageStatus = {
       configured: false,
       provider: null,
@@ -1267,7 +1010,7 @@ async function hydrateFromStorage() {
     const results = await Promise.all(
       STORAGE_FILES.map(async (name) => {
         try {
-          const r = await storageReadFile(name);
+          const r = await githubRepoReadFile(name);
           if (r && r.text) {
             fs.writeFileSync(path.join(dir, name), r.text);
             return { name, etag: r.etag || '' };
@@ -1293,7 +1036,6 @@ async function hydrateFromStorage() {
     provider,
     hydrated: got,
     etag: storageLastEtag || null,
-    ...(storageMigratedFrom ? { migratedFrom: storageMigratedFrom } : {}),
   };
   return lastStorageStatus;
 }
@@ -1304,7 +1046,7 @@ async function pullStorageIntoMemory() {
   if (Date.now() - storagePullAt < 1500) return { skipped: 'throttled' };
 
   storagePullInflight = (async () => {
-    const r = await storageReadFile('sub-store.json');
+    const r = await githubRepoReadFile('sub-store.json');
     storagePullAt = Date.now();
     if (!r || !r.text) return { skipped: 'empty' };
     if (r.etag && r.etag === storageLastEtag) {
@@ -1329,7 +1071,6 @@ async function pullStorageIntoMemory() {
       provider: storageProvider(),
       pulled: true,
       etag: storageLastEtag,
-      ...(storageMigratedFrom ? { migratedFrom: storageMigratedFrom } : {}),
     };
     return { ok: true };
   })()
@@ -1450,7 +1191,7 @@ module.exports = async function handler(req, res) {
     capturedApp.__gistSyncInstalled = true;
   }
 
-  // 写请求返回前等待共享存储 (GitHub 仓库/R2/Blob) 上传完成，避免 Serverless 在定时器执行前冻结。
+  // 写请求返回前等待共享存储 (GitHub 仓库) 上传完成，避免 Serverless 在定时器执行前冻结。
   flushStorageBeforeResponseEnd(res);
 
   try {

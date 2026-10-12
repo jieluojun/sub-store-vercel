@@ -32,7 +32,7 @@
 
 ## ⚠️ 必读
 
-1. **务必自设私密路径**（部署时的环境变量），否则节点信息可能暴露。
+1. **务必自设私密路径**（部署时的环境变量），否则节点信息可能暴露。CORS 已完全放通（任意域名/前端均可直接调用后端），**私密路径是后端唯一防线**，请使用 16 位以上随机字符串；`SUB_STORE_CORS_ALLOWED_ORIGINS` 变量已无作用。
 
 2. **推荐：GitHub 私有仓库作为共享主存储**
 
@@ -74,9 +74,9 @@
 
    **速率与额度说明**：读取走条件请求（内容未变时 304，不计入限额），写入才会产生 API 调用；Token 每小时 5000 次，日常使用绰绰有余。单文件超过 100MB 无法用此 API 提交（Sub-Store 配置通常只有几十 KB，无需担心）。
 
-3. **从旧方案（R2 / Vercel Blob）换用 GitHub 仓库**
+3. **从旧版本（R2 / Vercel Blob 存储）换用**
 
-   程序不会自动搬运旧存储里的数据。换用时：先在旧部署的面板 **我的 → 数据管理/同步** 做一次 Gist 备份 → 配置好 GitHub 仓库变量（可同时移除 R2/Blob 变量）并重新部署 → 按下面第 4 条设置 `SUB_STORE_DATA_URL`，冷启动会从 Gist 还原数据，之后在面板随便保存一次即写入私有仓库 → 确认 `sub-store-data/sub-store.json` 出现在私有仓库后，移除 `SUB_STORE_DATA_URL` 完成切换。
+   本版本已完全移除 R2 / Vercel Blob 存储代码，也不会自动搬运旧存储里的数据。换用时：先在旧部署的面板 **我的 → 数据管理/同步** 做一次 Gist 备份 → 删除 R2/Blob 相关变量、配置好 GitHub 仓库变量并重新部署 → 按下面第 4 条设置 `SUB_STORE_DATA_URL`，冷启动会从 Gist 还原数据，之后在面板随便保存一次即写入私有仓库 → 确认 `sub-store-data/sub-store.json` 出现在私有仓库后，移除 `SUB_STORE_DATA_URL` 完成切换。
 
 4. **Gist 作为额外备份/灾难恢复**
    1. 打开面板 → **我的** → **数据管理/同步** → 选 **Gist** → 填 GitHub Token（[点此创建](https://github.com/settings/tokens/new)，勾 **gist** 权限即可）→ **保存并同步/上传**；
@@ -85,13 +85,11 @@
 
    有共享存储数据时以共享存储为准；存储为空或未配置共享存储时，`SUB_STORE_DATA_URL` 可用于冷启动恢复。Raw URL 等同于备份内容，请勿泄露。
 
-5. **兼容旧方案**：未配置任何 GitHub 仓库变量时，原来的 R2 / Vercel Blob（`BLOB_READ_WRITE_TOKEN`）逻辑仍然有效，方便平滑迁移；新部署建议直接使用 GitHub 私有仓库。
+5. **国内访问** `*.vercel.app` 空白：挂代理，或在 Settings → Domains 绑定自有域名。
 
-6. **自定义域名 / 任意前端**：已**完全去除 CORS 白名单拦截**——绑定任意自定义域名、或用任何第三方前端（官方在线版 `sub-store.vercel.app`、Stash 等）调用后端，均无需任何配置。⚠️ 因此**私密路径是后端唯一防线**，务必保持足够长的随机字符串；`SUB_STORE_CORS_ALLOWED_ORIGINS` 变量已无作用，无需设置。
+6. **排查**：检查 `__substore_selftest` 的 JSON。重点查看 `objectStorageProvider`、`objectStorageStatus`、`githubRepoMissingEnv` 和 `recentErrors`。
 
-7. **国内访问** `*.vercel.app` 空白：挂代理，或在 Settings → Domains 绑定自有域名。
-
-8. **排查**：检查 `__substore_selftest` 的 JSON。重点查看 `objectStorageProvider`、`objectStorageStatus`、`githubRepoMissingEnv` 和 `recentErrors`。
+7. **速度说明**：首次打开慢主要是 **Vercel 冷启动**（免费版闲置约 10-15 分钟后回收实例，下一个请求要重新初始化：解压前端 → 从私有仓库并行拉数据 → 启动后端）。已做的优化：数据文件并行拉取、启动后节流去重、GitHub 请求 6-15 秒超时兜底。想进一步消除冷启动等待，可用免费拨测服务（如 [cron-job.org](https://cron-job.org)）每 5 分钟 GET 一次 `https://你的域名/__substore_selftest` 保持实例温热。热请求下，面板打开时每次仅多一次 GitHub 条件查询（304 秒回，通常不到 300ms）。
 
 ## 📁 文件说明
 
