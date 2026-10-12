@@ -22,7 +22,7 @@ const path = require('path');
 const fs = require('fs');
 const zlib = require('zlib');
 
-const ENTRY_VERSION = 'v10.3-fast-cold-start-2026-10-12';
+const ENTRY_VERSION = 'v10.4-entry-no-cache-2026-10-12';
 
 /* ================= 默认配置 (可在 Vercel 环境变量中覆盖) ================= */
 
@@ -589,6 +589,51 @@ function installGistSync(app) {
  * ⚠️ 此后私密路径 (SUB_STORE_FRONTEND_BACKEND_PATH) 是后端唯一防线,
  *    务必保持足够长的随机字符串。
  */
+/* ---------- 前端入口文件禁缓存: 防止升级后白屏 ----------
+ * 前端分块文件名带内容哈希 (可安全强缓存一年), 但入口文件
+ * (index.html / index.js / sw.js 等) 是固定文件名: 官方后端给它们
+ * 设置了 max-age=14400, 经过 Cloudflare 等代理和浏览器缓存后,
+ * 重新部署 (分块哈希全部变化) 时, 客户端可能仍拿着旧入口文件去
+ * 加载已不存在的旧分块 → 白屏。
+ * 这里强制入口文件 Cache-Control: no-cache (每次校验), 分块维持
+ * immutable 强缓存; 拦截 setHeader 以覆盖官方静态服务的默认值。
+ */
+const FRONTEND_ENTRY_FILES = [
+  '/',
+  '/index.html',
+  '/index.js',
+  '/sw.js',
+  '/registerSW.js',
+  '/manifests.json',
+  '/manifest.webmanifest',
+];
+
+function isFrontendEntryFile(reqPath) {
+  return (
+    FRONTEND_ENTRY_FILES.includes(reqPath) || reqPath.startsWith('/favicon')
+  );
+}
+
+function installCacheHeaders(app) {
+  prependMiddleware(app, (req, res, next) => {
+    const reqPath = (req.url || '').split('?')[0].replace(/\/+$/, '') || '/';
+    if (
+      (req.method || 'GET').toUpperCase() === 'GET' &&
+      isFrontendEntryFile(reqPath)
+    ) {
+      const origSetHeader = res.setHeader.bind(res);
+      res.setHeader = function patchedSetHeader(name, value) {
+        if (String(name).toLowerCase() === 'cache-control') {
+          return origSetHeader('Cache-Control', 'no-cache');
+        }
+        return origSetHeader(name, value);
+      };
+      res.setHeader('Cache-Control', 'no-cache');
+    }
+    next();
+  });
+}
+
 function installOpenCors(app) {
   prependMiddleware(app, (req, res, next) => {
     const origin = req.headers && req.headers.origin;
@@ -1401,6 +1446,7 @@ module.exports = async function handler(req, res) {
   if (!capturedApp.__gistSyncInstalled) {
     installGistSync(capturedApp);
     installOpenCors(capturedApp); // 置于最前: 预检请求不触发存储拉取
+    installCacheHeaders(capturedApp);
     capturedApp.__gistSyncInstalled = true;
   }
 
