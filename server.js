@@ -22,7 +22,10 @@ const path = require('path');
 const fs = require('fs');
 const zlib = require('zlib');
 
-const ENTRY_VERSION = 'v11-github-only-storage-2026-10-12';
+const ENTRY_VERSION = 'v12-github-storage-memory-sync-2026-10-17';
+
+let sharedStorageBootstrapActive = false;
+let userDataRestoreConfigured = false;
 
 /* ================= 默认配置 (可在 Vercel 环境变量中覆盖) ================= */
 
@@ -177,11 +180,11 @@ setDefaultEnv('SUB_STORE_BACKEND_MERGE', 'true'); // 前后端同域名
 if (frontendPath) setDefaultEnv('SUB_STORE_FRONTEND_PATH', frontendPath);
 setDefaultEnv('SUB_STORE_DATA_BASE_PATH', '/tmp/sub-store-data'); // 仅 /tmp 可写
 
-// 启动还原成功后把官方 Env 实例挂到全局, 供每次请求把 Gist 写进内存 (解决多 Lambda /tmp 不一致)
+// 启动还原成功后把官方 Env 实例挂到全局, 供共享存储/Gist 快照更新后刷新后端内存 (解决多 Lambda /tmp 不一致)
 {
   const userPost = process.env.SUB_STORE_DATA_URL_POST || '';
   process.env.SUB_STORE_DATA_URL_POST =
-    'try{globalThis.__ssT=T;globalThis.__ssRestore=function(c){T.write(JSON.stringify(c,null,"  "),"#sub-store");T.cache=c;T.persistCache();if(typeof Fc==="function")try{Fc()}catch(e){}}}catch(e){}' +
+    'try{globalThis.__ssT=T;globalThis.__ssRestore=function(c){globalThis.__ssStorageHydrating=true;T.write(JSON.stringify(c,null,"  "),"#sub-store");T.cache=c;T.persistCache();if(typeof Fc==="function")try{Fc()}catch(e){}}}catch(e){}' +
     (userPost ? ';' + userPost : '');
 }
 
@@ -309,7 +312,8 @@ function selfTest(res) {
     frontendReady: frontendPath ? 'ok' : null,
     frontendError: frontendError ? String(frontendError.message) : null,
     autoUpdateVia: 'GitHub Actions (定时每天 + 手动 Run workflow)',
-    dataRestoreConfigured: !!process.env.SUB_STORE_DATA_URL,
+    dataRestoreConfigured: userDataRestoreConfigured,
+    sharedStorageBootstrapActive,
     objectStorageConfigured: storageConfigured(),
     objectStorageProvider: storageProvider(),
     objectStorageStatus: lastStorageStatus,
@@ -947,6 +951,7 @@ function hookFsWritesToStorage() {
       const abs = path.resolve(String(p));
       if (
         !storageHydrating &&
+        !globalThis.__ssStorageHydrating &&
         abs.startsWith(dir + path.sep) &&
         STORAGE_FILES.includes(path.basename(abs))
       ) {
@@ -1064,6 +1069,7 @@ async function pullStorageIntoMemory() {
       }
     } finally {
       storageHydrating = false;
+      globalThis.__ssStorageHydrating = false;
     }
     storageLastEtag = r.etag || storageLastEtag;
     lastStorageStatus = {
@@ -1099,31 +1105,52 @@ async function ensureBackend() {
     } catch (e) {
       pushError('storage-hydrate', e);
     }
-    // 启动还原若走 Gist Raw，可能用过期缓存盖掉共享存储；已有对象时让官方 DATA_URL 改读本地文件。
-    if (hydratedOk && process.env.SUB_STORE_DATA_URL) {
+    const configuredDataUrl = String(process.env.SUB_STORE_DATA_URL || '').trim();
+    userDataRestoreConfigured = Boolean(configuredDataUrl);
+    sharedStorageBootstrapActive = false;
+    if (configuredDataUrl) process.env.SUB_STORE_DATA_URL = configuredDataUrl;
+
+    // 共享仓库是主存储时，让官方后端从本实例刚刚 hydrate 的文件启动。
+    // Sub-Store 的 DATA_URL 加载器支持绝对本地路径；这会执行 DATA_URL_POST，
+    // 安装 __ssRestore，使之后每次发现 GitHub ETag 变化都能同步内存缓存。
+    if (hydratedOk && storageConfigured()) {
       const localBoot = path.join(
         process.env.SUB_STORE_DATA_BASE_PATH,
         'sub-store.json',
       );
-      const origFetch = global.fetch;
-      if (typeof origFetch === 'function') {
-        const bootUrl = process.env.SUB_STORE_DATA_URL;
-        global.fetch = async function (url, opts) {
-          try {
-            if (String(url).indexOf(String(bootUrl).split('?')[0]) === 0) {
-              const text = fs.readFileSync(localBoot, 'utf8');
-              return new Response(text, {
-                status: 200,
-                headers: { 'content-type': 'application/json' },
-              });
-            }
-          } catch (e) {}
-          return origFetch.apply(this, arguments);
-        };
+      try {
+        const localText = fs.readFileSync(localBoot, 'utf8');
+        if (!parseBackupPayload(localText)) {
+          throw new Error('共享仓库 sub-store.json 不包含有效的 settings 数据');
+        }
+        process.env.SUB_STORE_DATA_URL = localBoot;
+        sharedStorageBootstrapActive = true;
+      } catch (e) {
+        if (!configuredDataUrl) pushError('storage-bootstrap-prepare', e);
       }
     }
     try {
       require('./sub-store.min.js');
+      // Sub-Store 的 DATA_URL_POST 在异步恢复完成时才安装内存恢复钩子。
+      // 等待钩子就绪，避免冷启动首批 API 请求先返回旧内存数据。
+      if (hydratedOk && process.env.SUB_STORE_DATA_URL) {
+        const hookDeadline = Date.now() + 10000;
+        while (
+          typeof globalThis.__ssRestore !== 'function' &&
+          Date.now() < hookDeadline
+        ) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        if (typeof globalThis.__ssRestore !== 'function') {
+          pushError(
+            'storage-restore-hook',
+            new Error('共享存储启动后未能安装内存恢复钩子'),
+          );
+        } else {
+          // 启动期恢复完成后解除写入抑制；恢复本身不应再次提交到共享仓库。
+          globalThis.__ssStorageHydrating = false;
+        }
+      }
       backendReady = true;
     } catch (e) {
       backendError = e;
