@@ -22,7 +22,7 @@ const path = require('path');
 const fs = require('fs');
 const zlib = require('zlib');
 
-const ENTRY_VERSION = 'v12-github-storage-memory-sync-2026-10-17';
+const ENTRY_VERSION = 'v13-github-storage-memory-sync-2026-10-17';
 
 let sharedStorageBootstrapActive = false;
 let userDataRestoreConfigured = false;
@@ -184,7 +184,7 @@ setDefaultEnv('SUB_STORE_DATA_BASE_PATH', '/tmp/sub-store-data'); // ‰ªÖ /tmp Âè
 {
   const userPost = process.env.SUB_STORE_DATA_URL_POST || '';
   process.env.SUB_STORE_DATA_URL_POST =
-    'try{globalThis.__ssT=T;globalThis.__ssRestore=function(c){globalThis.__ssStorageHydrating=true;T.write(JSON.stringify(c,null,"  "),"#sub-store");T.cache=c;T.persistCache();if(typeof Fc==="function")try{Fc()}catch(e){}}}catch(e){}' +
+    'try{globalThis.__ssT=P;globalThis.__ssRestore=function(c){globalThis.__ssStorageHydrating=true;P.write(JSON.stringify(c,null,"  "),"#sub-store");P.cache=c;P.persistCache();if(typeof oc==="function")try{oc()}catch(e){console.error("[sub-store] restore migration failed:",e)}}}catch(e){console.error("[sub-store] restore hook install failed:",e)}' +
     (userPost ? ';' + userPost : '');
 }
 
